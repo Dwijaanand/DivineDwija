@@ -101,7 +101,7 @@ if len(picks) == 0:
 else:
     df = pd.DataFrame(picks).sort_values(by="Vol_X", ascending=False)
     msg = f"🚀 *CHANDAN BUY ALERT - {datetime.now().strftime('%d %b %H:%M')}* 🚀\nScanned: {len(ALL_TOKENS)} Stocks | Found: {len(df)}\n\n"
-[14/09/2026 11:52 AM] Anand Thanki: for _, row in df.iterrows():
+for _, row in df.iterrows():
         target1 = round(row['LTP'] * 1.04, 2)
         target2 = round(row['LTP'] * 1.06, 2)
         msg += f"*{row['Stock']}* - LTP:{row['LTP']} (52W:{row['52W_High']})\nVol: {row['Vol_X']}x | SL: {row['SL']}\nTGT: {target1} / {target2}\n\n"
