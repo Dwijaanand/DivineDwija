@@ -1,1063 +1,262 @@
-import os
-import sys
-import time
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
+import os,time,requests,pyotp,pandas as pd
+from datetime import datetime,timedelta
 from SmartApi import SmartConnect
-import pyotp
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
+API=os.getenv("API_KEY"); CID=os.getenv("CLIENT_ID")
+PWD=os.getenv("PASSWORD"); TOTP=os.getenv("TOTP_SECRET")
+TG=os.getenv("TELEGRAM_BOT_TOKEN"); CHAT=os.getenv("TELEGRAM_CHAT_ID")
 
-# ============================================================
-# ANGEL ONE SWING SCANNER - SPEED FINAL
-# ============================================================
-#
-# FULL NSE-EQ UNIVERSE
-# BULK CURRENT VOLUME FILTER
-# DAILY + WEEKLY CONFIRMATION
-# TELEGRAM ALERT
-#
-# AUTO ORDER = DISABLED
-#
-# STRATEGY:
-#
-# 1. All NSE-EQ stocks from Angel instrument master
-#
-# 2. Fast bulk quote scan
-#       Current volume >= 100,000
-#
-# 3. Rank current volume
-#       TOP 80
-#
-# 4. Daily chart:
-#       Price >= Rs.50
-#       20D Average Volume >= 50,000
-#       Latest Volume >= 2x 20D Average
-#       Close > 200 DMA
-#       Close >= 92% of 52 Week High
-#       Green Daily Candle
-#
-# 5. Weekly confirmation:
-#       Weekly Close > Daily 200 DMA
-#       Latest Weekly Close > Previous Weekly Close
-#
-# 6. Entry:
-#       Latest completed daily close
-#
-# 7. SL:
-#       Latest completed daily low
-#
-# 8. Targets:
-#       T1 = 2R
-#       T2 = 3R
-#
-# 9. Telegram
-#
-# NO AUTOMATIC ORDERS
-#
-# Excluded:
-#       TATAMOTORS
-#       LTIM
-#
-# Added / retained:
-#       ADANIPOWER
-#
-# ============================================================
+MASTER="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
+def telegram(msg):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG}/sendMessage",
+            data={"chat_id":CHAT,"text":msg,"parse_mode":"Markdown"},
+            timeout=15
+        )
+    except: pass
 
-# ============================================================
-# TIMEZONE
-# ============================================================
+def hist(token,days=380,interval="ONE_DAY"):
+    try:
+        p={
+            "exchange":"NSE","symboltoken":token,"interval":interval,
+            "fromdate":(datetime.now()-timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
+            "todate":datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+        r=obj.getCandleData(p)
+        if r and r.get("data"):
+            return pd.DataFrame(
+                r["data"],
+                columns=["time","open","high","low","close","volume"]
+            )
+    except Exception as e:
+        if "access rate" in str(e).lower():
+            time.sleep(3)
+    return None
 
-IST = ZoneInfo("Asia/Kolkata")
+print("\n======================================")
+print(" ANGEL ONE SWING SCANNER V3.4.8 FAST")
+print("======================================",flush=True)
 
+# LOGIN
+print("Login...",flush=True)
+obj=SmartConnect(api_key=API)
+sess=obj.generateSession(
+    CID,PWD,pyotp.TOTP(TOTP).now()
+)
+print("Angel OK",flush=True)
 
-# ============================================================
-# GITHUB SECRETS
-# ============================================================
+# MASTER
+print("Loading NSE master...",flush=True)
+master=requests.get(MASTER,timeout=30).json()
 
-API_KEY = os.getenv("API_KEY", "").strip()
-CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
-PASSWORD = os.getenv("PASSWORD", "").strip()
-TOTP_SECRET = os.getenv("TOTP_SECRET", "").strip()
+tokens={}
+for x in master:
+    seg=str(x.get("exch_seg","")).lower()
+    sym=str(x.get("symbol",""))
+    if seg in ("nse","nse_cm") and sym.endswith("-EQ"):
+        s=sym[:-3]
+        if s not in ("LTIM","TATAMOTORS"):
+            tokens[s]=str(x["token"])
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
+stocks=list(tokens.items())
+print(f"NSE stocks: {len(stocks)}",flush=True)
 
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-).strip()
+# ------------------------------------------------
+# BULK MARKET DATA
+# ------------------------------------------------
+def bulk_quotes(token_list):
+    out={}
 
+    for i in range(0,len(token_list),50):
+        batch=token_list[i:i+50]
 
-# ============================================================
-# ANGEL INSTRUMENT MASTER
-# ============================================================
+        for attempt in range(3):
+            try:
+                r=obj.getMarketData(
+                    "FULL",
+                    {"NSE":batch}
+                )
 
-INSTRUMENT_URL = (
-    "https://margincalculator.angelbroking.com/"
-    "OpenAPI_File/files/OpenAPIScripMaster.json"
+                data=(r or {}).get("data",{})
+                rows=[]
+
+                if isinstance(data,dict):
+                    rows=data.get("fetched",[]) or data.get("data",[])
+                elif isinstance(data,list):
+                    rows=data
+
+                for q in rows:
+                    t=str(q.get("symbolToken",""))
+                    out[t]=q
+
+                break
+
+            except Exception as e:
+                print("Bulk retry:",e,flush=True)
+                time.sleep(3*(attempt+1))
+
+        # Angel bulk quote endpoint safety
+        time.sleep(1.1)
+
+        print(
+            f"Bulk quote {min(i+50,len(token_list))}/{len(token_list)}",
+            flush=True
+        )
+
+    return out
+
+print("\nPHASE 1: BULK VOLUME SCAN...",flush=True)
+
+q=bulk_quotes([t for _,t in stocks])
+
+# Current volume >= 100000 is mathematically necessary
+# because final rule requires Avg20 >= 50000 AND Volume >= 2x.
+candidates=[]
+
+for sym,token in stocks:
+    x=q.get(token,{})
+    try:
+        ltp=float(x.get("ltp",0))
+        vol=float(
+            x.get("tradeVolume",x.get("tradeVolume",0)) or 0
+        )
+
+        if ltp>=50 and vol>=100000:
+            candidates.append({
+                "sym":sym,
+                "token":token,
+                "ltp":ltp,
+                "volume":vol
+            })
+    except:
+        pass
+
+candidates.sort(key=lambda x:x["volume"],reverse=True)
+candidates=candidates[:80]
+
+print(
+    f"PHASE 1 DONE: {len(candidates)} candidates / "
+    f"{len(stocks)} NSE stocks",
+    flush=True
 )
 
-
-# ============================================================
-# STRATEGY SETTINGS
-# ============================================================
-
-TOP_N = 80
-
-MIN_PRICE = 50.0
-
-MIN_AVG_VOL_20 = 50000
-
-MIN_VOL_X = 2.0
-
-# Since:
-#
-# Avg Volume >= 50,000
-# Volume >= 2x Avg Volume
-#
-# Minimum possible latest volume is:
-#
-# 50,000 x 2 = 100,000
-#
-# So Phase-1 bulk scan can safely reject anything
-# below 100,000 current volume.
-
-MIN_CURRENT_VOLUME = 100000
-
-# Close must be >= 92% of 52-week high
-NEAR_52W_PCT = 0.92
-
-# Need enough history for:
-# 200 DMA
-# 252 trading days ~= 52 weeks
-DAILY_LOOKBACK_DAYS = 420
-
-
-# ============================================================
-# SPEED / API SETTINGS
-# ============================================================
-
-# Angel bulk quote request
-# Keep at or below 50 tokens per request.
-QUOTE_BATCH_SIZE = 50
-
-QUOTE_DELAY = 0.40
-
-
-# Historical candle API pacing.
-#
-# We deliberately keep this slower than bulk quote requests
-# because getCandleData is the endpoint most likely to hit
-# access-rate restrictions.
-HIST_DELAY = 0.65
-
-HIST_RETRY_DELAY = 8
-
-MAX_HIST_RETRIES = 5
-
-# Cooling pause after historical requests
-BATCH_PAUSE_EVERY = 20
-
-BATCH_PAUSE_SECONDS = 3
-
-REQUEST_TIMEOUT = 25
-
-
-# ============================================================
-# EXCLUDED STOCKS
-# ============================================================
-
-EXCLUDED_SYMBOLS = {
-    "TATAMOTORS",
-    "LTIM",
-}
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(message):
-
-    now = datetime.now(IST).strftime(
-        "%d-%m-%Y %H:%M:%S IST"
-    )
-
-    print(
-        f"[{now}] {message}",
-        flush=True
-    )
-
-
-# ============================================================
-# FATAL ERROR
-# ============================================================
-
-def fail(message):
-
-    log("FATAL: " + message)
-
-    sys.exit(1)
-
-
-# ============================================================
-# VALIDATE GITHUB SECRETS
-# ============================================================
-
-def validate_config():
-
-    required = {
-        "API_KEY": API_KEY,
-        "CLIENT_ID": CLIENT_ID,
-        "PASSWORD": PASSWORD,
-        "TOTP_SECRET": TOTP_SECRET,
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-    }
-
-    missing = [
-        key
-        for key, value in required.items()
-        if not value
-    ]
-
-    if missing:
-
-        fail(
-            "Missing GitHub Secret(s): "
-            + ", ".join(missing)
-        )
-
-
-# ============================================================
-# ANGEL LOGIN
-# ============================================================
-
-def login():
-
-    log("Logging into Angel One...")
-
-    smart = SmartConnect(
-        api_key=API_KEY
-    )
-
-    last_error = None
-
-    for attempt in range(1, 4):
-
-        try:
-
-            log(
-                f"Generating TOTP... attempt "
-                f"{attempt}/3"
-            )
-
-            totp = pyotp.TOTP(
-                TOTP_SECRET
-            ).now()
-
-            session = smart.generateSession(
-                CLIENT_ID,
-                PASSWORD,
-                totp
-            )
-
-            if not session:
-
-                raise RuntimeError(
-                    "Empty login response"
-                )
-
-            if not session.get("status"):
-
-                raise RuntimeError(
-                    f"Login failed: {session}"
-                )
-
-            # Feed token
-            smart.getfeedToken()
-
-            log(
-                "Angel One login successful."
-            )
-
-            return smart
-
-        except Exception as exc:
-
-            last_error = exc
-
-            log(
-                f"Login attempt {attempt}/3 "
-                f"failed: {exc}"
-            )
-
-            if attempt < 3:
-
-                time.sleep(3)
-
-    raise RuntimeError(
-        "Angel login failed after 3 attempts: "
-        f"{last_error}"
-    )
-
-
-# ============================================================
-# DOWNLOAD INSTRUMENT MASTER
-# ============================================================
-
-def download_instruments():
-
-    log(
-        "Downloading Angel instrument master..."
-    )
-
-    response = requests.get(
-        INSTRUMENT_URL,
-        timeout=REQUEST_TIMEOUT
-    )
-
-    response.raise_for_status()
-
-    instruments = response.json()
-
-    if not isinstance(
-        instruments,
-        list
-    ):
-
-        raise RuntimeError(
-            "Instrument master format is invalid."
-        )
-
-    return instruments
-
-
-# ============================================================
-# BUILD FULL NSE-EQ UNIVERSE
-# ============================================================
-
-def build_nse_universe(instruments):
-
-    universe = []
-
-    seen = set()
-
-    for item in instruments:
-
-        if item.get("exch_seg") != "NSE":
-            continue
-
-        symbol = str(
-            item.get("name", "")
-        ).strip().upper()
-
-        token = str(
-            item.get("token", "")
-        ).strip()
-
-        trading_symbol = str(
-            item.get("symbol", "")
-        ).strip().upper()
-
-        if not symbol:
-            continue
-
-        if not token:
-            continue
-
-        if not trading_symbol:
-            continue
-
-        # Only equity
-        if not trading_symbol.endswith("-EQ"):
-            continue
-
-        # Remove unwanted stocks
-        if symbol in EXCLUDED_SYMBOLS:
-            continue
-
-        if symbol in seen:
-            continue
-
-        seen.add(symbol)
-
-        universe.append({
-            "symbol": symbol,
-            "token": token,
-            "trading_symbol": trading_symbol,
+print(
+    "TOP:",
+    [x["sym"] for x in candidates[:10]],
+    flush=True
+)
+
+# ------------------------------------------------
+# PHASE 2
+# ------------------------------------------------
+print("\nPHASE 2: DAILY + WEEKLY CHECK...",flush=True)
+
+picks=[]
+
+for n,x in enumerate(candidates,1):
+    print(f"[{n}/{len(candidates)}] {x['sym']}",flush=True)
+
+    df=hist(x["token"],380)
+
+    if df is None or len(df)<200:
+        continue
+
+    df["close"]=pd.to_numeric(df["close"])
+    df["open"]=pd.to_numeric(df["open"])
+    df["high"]=pd.to_numeric(df["high"])
+    df["low"]=pd.to_numeric(df["low"])
+    df["volume"]=pd.to_numeric(df["volume"])
+
+    last=df.iloc[-1]
+
+    # SAME VOLUME RULE
+    avg20=df["volume"].iloc[-21:-1].mean()
+    volx=float(last["volume"])/avg20 if avg20 else 0
+
+    if avg20<50000 or volx<2:
+        continue
+
+    # SAME DAILY CONDITIONS
+    dma200=df["close"].rolling(200).mean().iloc[-1]
+    high52=df["high"].tail(252).max()
+
+    near_high=float(last["close"])>=float(high52)*0.92
+    green=float(last["close"])>float(last["open"])
+
+    # WEEKLY FROM DAILY DATA
+    w=df.copy()
+    w["time"]=pd.to_datetime(w["time"])
+    w=w.set_index("time").resample("W-FRI").agg({
+        "open":"first",
+        "high":"max",
+        "low":"min",
+        "close":"last",
+        "volume":"sum"
+    }).dropna()
+
+    if len(w)<2:
+        continue
+
+    weekly_close=float(w["close"].iloc[-1])
+    weekly_up=weekly_close>float(dma200)
+
+    if weekly_up and near_high and green:
+        entry=float(last["close"])
+        sl=float(last["low"])
+
+        picks.append({
+            "Stock":x["sym"],
+            "LTP":entry,
+            "52W":float(high52),
+            "VolX":volx,
+            "SL":sl
         })
 
-    universe.sort(
-        key=lambda x: x["symbol"]
-    )
-
-    return universe
-
-
-# ============================================================
-# SAFE FLOAT
-# ============================================================
-
-def safe_float(
-    value,
-    default=0.0
-):
-
-    try:
-
-        if value is None:
-            return default
-
-        if value == "":
-            return default
-
-        return float(value)
-
-    except Exception:
-
-        return default
-
-
-# ============================================================
-# CHUNK LIST
-# ============================================================
-
-def chunked(
-    items,
-    size
-):
-
-    for i in range(
-        0,
-        len(items),
-        size
-    ):
-
-        yield items[
-            i:i + size
-        ]
-
-
-# ============================================================
-# EXTRACT BULK QUOTE DATA
-# ============================================================
-
-def extract_quote_items(
-    response
-):
-
-    if not isinstance(
-        response,
-        dict
-    ):
-
-        return []
-
-    data = response.get(
-        "data"
-    )
-
-    if isinstance(
-        data,
-        dict
-    ):
-
-        fetched = data.get(
-            "fetched"
+        print(
+            f"BUY FOUND: {x['sym']} "
+            f"Vol {volx:.1f}x",
+            flush=True
         )
 
-        if isinstance(
-            fetched,
-            list
-        ):
+    time.sleep(0.7)
 
-            return fetched
+# ------------------------------------------------
+# TELEGRAM
+# ------------------------------------------------
+now=datetime.now().strftime("%d %b %I:%M %p")
 
-        nested = data.get(
-            "data"
+if not picks:
+    msg=(
+        f"📉 *PURA NSE SCAN - {now}*\n\n"
+        f"Total NSE: {len(stocks)}\n"
+        f"Top Candidates: {len(candidates)}\n"
+        f"Final BUY: 0\n\n"
+        f"_Aaj qualifying setup nahi mila._"
+    )
+else:
+    picks.sort(key=lambda x:x["VolX"],reverse=True)
+
+    msg=(
+        f"🚀 *PURA NSE BUY - {now}* 🚀\n\n"
+        f"Total NSE: {len(stocks)}\n"
+        f"Top Candidates: {len(candidates)}\n"
+        f"BUY: {len(picks)}\n\n"
+    )
+
+    for r in picks:
+        e=r["LTP"]
+        msg+=(
+            f"*{r['Stock']}*\n"
+            f"LTP: ₹{e:.2f} | 52W: ₹{r['52W']:.2f}\n"
+            f"Vol: {r['VolX']:.2f}x | "
+            f"SL: ₹{r['SL']:.2f}\n"
+            f"TGT: ₹{e*1.05:.2f} / ₹{e*1.08:.2f}\n\n"
         )
 
-        if isinstance(
-            nested,
-            list
-        ):
+print("\n"+msg,flush=True)
+telegram(msg)
 
-            return nested
-
-    if isinstance(
-        data,
-        list
-    ):
-
-        return data
-
-    return []
-
-
-# ============================================================
-# GET VOLUME FROM QUOTE
-# ============================================================
-
-def extract_volume(item):
-
-    possible_fields = [
-
-        "tradeVolume",
-
-        "tradevolume",
-
-        "volume",
-
-        "totalTradedVolume",
-
-        "totalTradedVolumeToday",
-
-    ]
-
-    for field in possible_fields:
-
-        if field in item:
-
-            value = safe_float(
-                item.get(field),
-                0
-            )
-
-            if value > 0:
-
-                return value
-
-    return 0.0
-
-
-# ============================================================
-# GET LTP FROM QUOTE
-# ============================================================
-
-def extract_ltp(item):
-
-    possible_fields = [
-
-        "ltp",
-
-        "LTP",
-
-        "lastTradedPrice",
-
-    ]
-
-    for field in possible_fields:
-
-        if field in item:
-
-            value = safe_float(
-                item.get(field),
-                0
-            )
-
-            if value > 0:
-
-                return value
-
-    return 0.0
-
-
-# ============================================================
-# FAST PHASE 1
-#
-# BULK CURRENT VOLUME
-# ============================================================
-
-def get_current_volume_bulk(
-    smart,
-    universe
-):
-
-    log("")
-    log("=" * 70)
-    log("PHASE 1 - FAST BULK CURRENT VOLUME SCAN")
-    log("=" * 70)
-
-    log(
-        f"NSE stocks: {len(universe)}"
-    )
-
-    log(
-        f"Bulk batch size: "
-        f"{QUOTE_BATCH_SIZE}"
-    )
-
-    log(
-        f"Minimum current volume: "
-        f"{MIN_CURRENT_VOLUME:,}"
-    )
-
-    volume_rows = []
-
-    total = len(universe)
-
-    processed = 0
-
-    batch_number = 0
-
-    for batch in chunked(
-        universe,
-        QUOTE_BATCH_SIZE
-    ):
-
-        batch_number += 1
-
-        tokens = [
-            stock["token"]
-            for stock in batch
-        ]
-
-        payload = {
-
-            "mode": "FULL",
-
-            "exchangeTokens": {
-
-                "NSE": tokens
-
-            }
-
-        }
-
-        response = None
-
-        # ----------------------------------------------------
-        # First attempt
-        # ----------------------------------------------------
-
-        try:
-
-            response = smart.getMarketData(
-                payload
-            )
-
-        except Exception as exc:
-
-            log(
-                f"Bulk quote batch "
-                f"{batch_number} error: "
-                f"{exc}"
-            )
-
-        # ----------------------------------------------------
-        # Retry once
-        # ----------------------------------------------------
-
-        if response is None:
-
-            time.sleep(2)
-
-            try:
-
-                response = smart.getMarketData(
-                    payload
-                )
-
-            except Exception as exc:
-
-                log(
-                    f"Bulk quote retry failed "
-                    f"batch {batch_number}: "
-                    f"{exc}"
-                )
-
-                response = None
-
-        # ----------------------------------------------------
-        # Process response
-        # ----------------------------------------------------
-
-        items = extract_quote_items(
-            response
-        )
-
-        by_token = {}
-
-        for item in items:
-
-            token = str(
-                item.get(
-                    "symbolToken",
-                    item.get(
-                        "symboltoken",
-                        ""
-                    )
-                )
-            ).strip()
-
-            if token:
-
-                by_token[token] = item
-
-        for stock in batch:
-
-            item = by_token.get(
-                stock["token"]
-            )
-
-            if not item:
-                continue
-
-            volume = extract_volume(
-                item
-            )
-
-            ltp = extract_ltp(
-                item
-            )
-
-            if volume < MIN_CURRENT_VOLUME:
-                continue
-
-            volume_rows.append({
-
-                **stock,
-
-                "current_volume": volume,
-
-                "ltp": ltp,
-
-            })
-
-        processed += len(batch)
-
-        if (
-            batch_number % 5 == 0
-            or processed >= total
-        ):
-
-            log(
-                f"Bulk progress: "
-                f"{processed}/{total} | "
-                f"Candidates: "
-                f"{len(volume_rows)}"
-            )
-
-        time.sleep(
-            QUOTE_DELAY
-        )
-
-    # --------------------------------------------------------
-    # Remove duplicates
-    # --------------------------------------------------------
-
-    unique = {}
-
-    for row in volume_rows:
-
-        unique[
-            row["symbol"]
-        ] = row
-
-    candidates = list(
-        unique.values()
-    )
-
-    # --------------------------------------------------------
-    # Sort by current volume
-    # --------------------------------------------------------
-
-    candidates.sort(
-        key=lambda x:
-        x["current_volume"],
-        reverse=True
-    )
-
-    # --------------------------------------------------------
-    # TOP 80
-    # --------------------------------------------------------
-
-    top_candidates = candidates[
-        :TOP_N
-    ]
-
-    log("")
-    log(
-        f"Bulk candidates: "
-        f"{len(candidates)}"
-    )
-
-    log(
-        f"TOP {TOP_N} selected: "
-        f"{len(top_candidates)}"
-    )
-
-    return (
-        candidates,
-        top_candidates
-    )
-
-
-# ============================================================
-# RATE LIMIT DETECTOR
-# ============================================================
-
-def is_rate_limit_error(
-    exc
-):
-
-    text = str(
-        exc
-    ).lower()
-
-    keywords = [
-
-        "exceeding access rate",
-
-        "access denied",
-
-        "403",
-
-        "429",
-
-        "rate limit",
-
-        "too many requests",
-
-    ]
-
-    for keyword in keywords:
-
-        if keyword in text:
-
-            return True
-
-    return False
-
-
-# ============================================================
-# GET DAILY CANDLES
-# ============================================================
-
-def get_daily_candles(
-    smart,
-    token
-):
-
-    # Current time
-    now = datetime.now(
-        IST
-    )
-
-    # We intentionally stop at yesterday.
-    #
-    # This prevents today's incomplete candle
-    # from becoming a swing signal.
-
-    yesterday = (
-        now - timedelta(days=1)
-    ).date()
-
-    start_date = (
-        yesterday
-        - timedelta(
-            days=DAILY_LOOKBACK_DAYS
-        )
-    )
-
-    params = {
-
-        "exchange": "NSE",
-
-        "symboltoken": str(
-            token
-        ),
-
-        "interval": "ONE_DAY",
-
-        "fromdate":
-            f"{start_date.isoformat()} 09:15",
-
-        "todate":
-            f"{yesterday.isoformat()} 15:30",
-
-    }
-
-    for attempt in range(
-        1,
-        MAX_HIST_RETRIES + 1
-    ):
-
-        try:
-
-            response = smart.getCandleData(
-                params
-            )
-
-            if not isinstance(
-                response,
-                dict
-            ):
-
-                raise RuntimeError(
-                    f"Unexpected candle response: "
-                    f"{response}"
-                )
-
-            if not response.get(
-                "status"
-            ):
-
-                message = response.get(
-                    "message",
-                    response.get(
-                        "errorcode",
-                        "Unknown candle error"
-                    )
-                )
-
-                raise RuntimeError(
-                    str(message)
-                )
-
-            data = response.get(
-                "data"
-            ) or []
-
-            if not data:
-
-                return None
-
-            df = pd.DataFrame(
-
-                data,
-
-                columns=[
-                    "date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                ]
-
-            )
-
-            # ------------------------------------------------
-            # Numeric conversion
-            # ------------------------------------------------
-
-            numeric_columns = [
-
-                "open",
-
-                "high",
-
-                "low",
-
-                "close",
-
-                "volume",
-
-            ]
-
-            for column in numeric_columns:
-
-                df[column] = pd.to_numeric(
-
-                    df[column],
-
-                    errors="coerce"
-
-                )
-
-            # ------------------------------------------------
-            # Date conversion
-            # ------------------------------------------------
-
-            df["date"] = pd.to_datetime(
-
-                df["date"],
-
-                errors="coerce"
-
-            )
-
-            # ------------------------------------------------
-            # Remove invalid rows
-            # ------------------------------------------------
-
-            df = df.dropna(
-
-                subset=[
-
-                    "date",
-
-                    "open",
-
-                    "high",
-
-                    "low",
-
-                    "close",
-
-                    "volume",
-
-                ]
-
-            )
-
-            # ------------------------------------------------
-            # Sort
-            # ------------------------------------------------
-
-            df = df.sort_values(
-                "date"
-            )
-
-            df = df.drop_duplicates(
-                subset=["date"],
-                keep="last"
-            )
-
-            df = df.reset_index(
-                drop=True
-            )
-
-            # ------------------------------------------------
-            # Safety:
-            # never use today's candle
-            # ------------------------------------------------
-
-            today = datetime.now(
-                IST
-            ).date()
-
-            df = df[
-                df["date"].dt.date
-                < today
-            ].copy()
-
-            # Need at least 200+ candles
-            if len(df) < 205:
-
-                return None
-
-            return df
-
-        except Exception as exc:
-
-            # Last attempt
-            if attempt >= MAX_HIST_RETRIES:
-
-                log(
-                    "Historical API failed after "
-                    f"{MAX_HIST_RETRIES} attempts: "
-                    f"{exc}"
-                )
-
-                return None
-
-            # ----------------------------
+print("\nDONE - FAST NSE SCAN COMPLETE",flush=True)
