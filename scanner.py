@@ -1,146 +1,217 @@
 import os
+import sys
 import time
-import json
 import requests
-import pyotp
 import pandas as pd
-
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from SmartApi import SmartConnect
+import pyotp
 
 
 # ============================================================
-# CHANDAN PURA NSE HIGH-VOLUME SWING SCANNER
-# GitHub Actions + Angel One + Telegram
+# ANGEL ONE SWING SCANNER - SPEED FINAL
+# ============================================================
 #
-# FLOW:
-# 1. Load complete NSE-EQ universe from Angel instrument master
-# 2. Read DAILY candles from Angel One for NSE stocks
-# 3. Find high-volume stocks
-# 4. Rank and keep Top 80
-# 5. Read DAILY + WEEKLY candles for Top 80
-# 6. Check swing setup
-# 7. Send final signals to Telegram
+# FULL NSE-EQ UNIVERSE
+# BULK CURRENT VOLUME FILTER
+# DAILY + WEEKLY CONFIRMATION
+# TELEGRAM ALERT
 #
-# NO AUTO ORDERS
+# AUTO ORDER = DISABLED
+#
+# STRATEGY:
+#
+# 1. All NSE-EQ stocks from Angel instrument master
+#
+# 2. Fast bulk quote scan
+#       Current volume >= 100,000
+#
+# 3. Rank current volume
+#       TOP 80
+#
+# 4. Daily chart:
+#       Price >= Rs.50
+#       20D Average Volume >= 50,000
+#       Latest Volume >= 2x 20D Average
+#       Close > 200 DMA
+#       Close >= 92% of 52 Week High
+#       Green Daily Candle
+#
+# 5. Weekly confirmation:
+#       Weekly Close > Daily 200 DMA
+#       Latest Weekly Close > Previous Weekly Close
+#
+# 6. Entry:
+#       Latest completed daily close
+#
+# 7. SL:
+#       Latest completed daily low
+#
+# 8. Targets:
+#       T1 = 2R
+#       T2 = 3R
+#
+# 9. Telegram
+#
+# NO AUTOMATIC ORDERS
+#
+# Excluded:
+#       TATAMOTORS
+#       LTIM
+#
+# Added / retained:
+#       ADANIPOWER
+#
 # ============================================================
 
 
-# -----------------------------
-# ENVIRONMENT / SECRETS
-# -----------------------------
+# ============================================================
+# TIMEZONE
+# ============================================================
 
-API_KEY = os.getenv("API_KEY")
-CLIENT_ID = os.getenv("CLIENT_ID")
-PASSWORD = os.getenv("PASSWORD")
-TOTP_SECRET = os.getenv("TOTP_SECRET")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+IST = ZoneInfo("Asia/Kolkata")
 
 
-# -----------------------------
-# SETTINGS
-# -----------------------------
+# ============================================================
+# GITHUB SECRETS
+# ============================================================
+
+API_KEY = os.getenv("API_KEY", "").strip()
+CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
+PASSWORD = os.getenv("PASSWORD", "").strip()
+TOTP_SECRET = os.getenv("TOTP_SECRET", "").strip()
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+).strip()
+
+
+# ============================================================
+# ANGEL INSTRUMENT MASTER
+# ============================================================
 
 INSTRUMENT_URL = (
     "https://margincalculator.angelbroking.com/"
     "OpenAPI_File/files/OpenAPIScripMaster.json"
 )
 
-TOP_VOLUME_COUNT = 80
+
+# ============================================================
+# STRATEGY SETTINGS
+# ============================================================
+
+TOP_N = 80
 
 MIN_PRICE = 50.0
-MIN_AVG_VOLUME = 50000
 
-# High-volume condition
-MIN_VOLUME_X = 2.0
+MIN_AVG_VOL_20 = 50000
 
-# High-volume scan uses enough history for volume average
-DAILY_LOOKBACK_DAYS = 45
+MIN_VOL_X = 2.0
 
-# Final daily chart history
-DAILY_HISTORY_DAYS = 420
+# Since:
+#
+# Avg Volume >= 50,000
+# Volume >= 2x Avg Volume
+#
+# Minimum possible latest volume is:
+#
+# 50,000 x 2 = 100,000
+#
+# So Phase-1 bulk scan can safely reject anything
+# below 100,000 current volume.
 
-# Weekly chart history
-WEEKLY_HISTORY_DAYS = 900
+MIN_CURRENT_VOLUME = 100000
 
-# Conservative API pacing.
-# Do NOT use 15 parallel candle requests.
-REQUEST_DELAY = 0.45
+# Close must be >= 92% of 52-week high
+NEAR_52W_PCT = 0.92
 
-# Extra pause after a group of requests
-BATCH_SIZE = 40
-BATCH_PAUSE = 5.0
-
-# Retry configuration
-MAX_RETRIES = 4
-RETRY_BASE_SECONDS = 8
-
-# Final setup
-NEAR_52W_PERCENT = 0.92
-
-# GitHub Actions should run after market data is sufficiently formed.
-# Workflow itself is set for 3 PM IST.
-USE_COMPLETED_DAILY_CANDLE = True
+# Need enough history for:
+# 200 DMA
+# 252 trading days ~= 52 weeks
+DAILY_LOOKBACK_DAYS = 420
 
 
-# -----------------------------
+# ============================================================
+# SPEED / API SETTINGS
+# ============================================================
+
+# Angel bulk quote request
+# Keep at or below 50 tokens per request.
+QUOTE_BATCH_SIZE = 50
+
+QUOTE_DELAY = 0.40
+
+
+# Historical candle API pacing.
+#
+# We deliberately keep this slower than bulk quote requests
+# because getCandleData is the endpoint most likely to hit
+# access-rate restrictions.
+HIST_DELAY = 0.65
+
+HIST_RETRY_DELAY = 8
+
+MAX_HIST_RETRIES = 5
+
+# Cooling pause after historical requests
+BATCH_PAUSE_EVERY = 20
+
+BATCH_PAUSE_SECONDS = 3
+
+REQUEST_TIMEOUT = 25
+
+
+# ============================================================
+# EXCLUDED STOCKS
+# ============================================================
+
+EXCLUDED_SYMBOLS = {
+    "TATAMOTORS",
+    "LTIM",
+}
+
+
+# ============================================================
 # LOGGING
-# -----------------------------
+# ============================================================
 
-def log(msg):
+def log(message):
+
+    now = datetime.now(IST).strftime(
+        "%d-%m-%Y %H:%M:%S IST"
+    )
+
     print(
-        f"[{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}] "
-        f"{msg}",
+        f"[{now}] {message}",
         flush=True
     )
 
 
-# -----------------------------
-# TELEGRAM
-# -----------------------------
+# ============================================================
+# FATAL ERROR
+# ============================================================
 
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram secrets missing.")
-        return False
+def fail(message):
 
-    try:
-        url = (
-            f"https://api.telegram.org/bot"
-            f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-        )
+    log("FATAL: " + message)
 
-        response = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-            },
-            timeout=20,
-        )
-
-        if response.ok:
-            log("Telegram sent successfully.")
-            return True
-
-        log(
-            f"Telegram failed: HTTP {response.status_code} "
-            f"{response.text[:300]}"
-        )
-
-    except Exception as e:
-        log(f"Telegram error: {e}")
-
-    return False
+    sys.exit(1)
 
 
-# -----------------------------
-# VALIDATE SECRETS
-# -----------------------------
+# ============================================================
+# VALIDATE GITHUB SECRETS
+# ============================================================
 
-def validate_secrets():
+def validate_config():
+
     required = {
         "API_KEY": API_KEY,
         "CLIENT_ID": CLIENT_ID,
@@ -151,829 +222,842 @@ def validate_secrets():
     }
 
     missing = [
-        name for name, value in required.items()
+        key
+        for key, value in required.items()
         if not value
     ]
 
     if missing:
-        raise RuntimeError(
-            "Missing GitHub Secrets: " + ", ".join(missing)
+
+        fail(
+            "Missing GitHub Secret(s): "
+            + ", ".join(missing)
         )
 
 
-# -----------------------------
+# ============================================================
 # ANGEL LOGIN
-# -----------------------------
+# ============================================================
 
-def login_angel():
-    log("Login to Angel One...")
+def login():
 
-    obj = SmartConnect(api_key=API_KEY)
+    log("Logging into Angel One...")
 
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-
-    data = obj.generateSession(
-        CLIENT_ID,
-        PASSWORD,
-        totp
+    smart = SmartConnect(
+        api_key=API_KEY
     )
 
-    if not data:
-        raise RuntimeError("Angel login returned empty response.")
+    last_error = None
 
-    if data.get("status") is False:
-        raise RuntimeError(
-            f"Angel login failed: {data}"
-        )
+    for attempt in range(1, 4):
 
-    log("Angel One login successful.")
+        try:
 
-    return obj
+            log(
+                f"Generating TOTP... attempt "
+                f"{attempt}/3"
+            )
+
+            totp = pyotp.TOTP(
+                TOTP_SECRET
+            ).now()
+
+            session = smart.generateSession(
+                CLIENT_ID,
+                PASSWORD,
+                totp
+            )
+
+            if not session:
+
+                raise RuntimeError(
+                    "Empty login response"
+                )
+
+            if not session.get("status"):
+
+                raise RuntimeError(
+                    f"Login failed: {session}"
+                )
+
+            # Feed token
+            smart.getfeedToken()
+
+            log(
+                "Angel One login successful."
+            )
+
+            return smart
+
+        except Exception as exc:
+
+            last_error = exc
+
+            log(
+                f"Login attempt {attempt}/3 "
+                f"failed: {exc}"
+            )
+
+            if attempt < 3:
+
+                time.sleep(3)
+
+    raise RuntimeError(
+        "Angel login failed after 3 attempts: "
+        f"{last_error}"
+    )
 
 
-# -----------------------------
-# LOAD NSE INSTRUMENT MASTER
-# -----------------------------
+# ============================================================
+# DOWNLOAD INSTRUMENT MASTER
+# ============================================================
 
-def load_nse_universe():
-    log("Downloading Angel One instrument master...")
+def download_instruments():
+
+    log(
+        "Downloading Angel instrument master..."
+    )
 
     response = requests.get(
         INSTRUMENT_URL,
-        timeout=30
+        timeout=REQUEST_TIMEOUT
     )
 
     response.raise_for_status()
 
-    master = response.json()
+    instruments = response.json()
 
-    token_map = {}
+    if not isinstance(
+        instruments,
+        list
+    ):
 
-    for item in master:
+        raise RuntimeError(
+            "Instrument master format is invalid."
+        )
+
+    return instruments
+
+
+# ============================================================
+# BUILD FULL NSE-EQ UNIVERSE
+# ============================================================
+
+def build_nse_universe(instruments):
+
+    universe = []
+
+    seen = set()
+
+    for item in instruments:
 
         if item.get("exch_seg") != "NSE":
             continue
 
-        symbol = item.get("symbol", "")
-        token = item.get("token")
+        symbol = str(
+            item.get("name", "")
+        ).strip().upper()
 
-        if not symbol.endswith("-EQ"):
+        token = str(
+            item.get("token", "")
+        ).strip()
+
+        trading_symbol = str(
+            item.get("symbol", "")
+        ).strip().upper()
+
+        if not symbol:
             continue
 
         if not token:
             continue
 
-        clean_symbol = symbol[:-3]
+        if not trading_symbol:
+            continue
 
-        token_map[clean_symbol] = str(token)
+        # Only equity
+        if not trading_symbol.endswith("-EQ"):
+            continue
 
-    universe = sorted(
-        token_map.items(),
-        key=lambda x: x[0]
-    )
+        # Remove unwanted stocks
+        if symbol in EXCLUDED_SYMBOLS:
+            continue
 
-    log(
-        f"Total NSE-EQ stocks found: {len(universe)}"
+        if symbol in seen:
+            continue
+
+        seen.add(symbol)
+
+        universe.append({
+            "symbol": symbol,
+            "token": token,
+            "trading_symbol": trading_symbol,
+        })
+
+    universe.sort(
+        key=lambda x: x["symbol"]
     )
 
     return universe
 
 
-# -----------------------------
-# DATAFRAME CONVERTER
-# -----------------------------
+# ============================================================
+# SAFE FLOAT
+# ============================================================
 
-def candles_to_df(data):
-
-    if not data:
-        return None
-
-    try:
-        df = pd.DataFrame(
-            data,
-            columns=[
-                "time",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]
-        )
-
-        numeric_columns = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        ]
-
-        for col in numeric_columns:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
-
-        df = df.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]
-        )
-
-        if df.empty:
-            return None
-
-        df = df.reset_index(drop=True)
-
-        return df
-
-    except Exception as e:
-        log(f"DataFrame conversion error: {e}")
-        return None
-
-
-# -----------------------------
-# REMOVE INCOMPLETE DAILY CANDLE
-# -----------------------------
-
-def remove_incomplete_daily(df):
-
-    if df is None or df.empty:
-        return df
-
-    if not USE_COMPLETED_DAILY_CANDLE:
-        return df
-
-    try:
-        # Angel timestamps generally contain +05:30.
-        # At 3 PM the current candle can still be incomplete.
-        # Therefore use previous completed daily candle.
-        if len(df) >= 2:
-            return df.iloc[:-1].reset_index(drop=True)
-
-    except Exception:
-        pass
-
-    return df
-
-
-# -----------------------------
-# ANGEL CANDLE REQUEST
-# -----------------------------
-
-def get_candles(
-    obj,
-    token,
-    interval,
-    from_date,
-    to_date,
-    label=""
+def safe_float(
+    value,
+    default=0.0
 ):
 
-    params = {
-        "exchange": "NSE",
-        "symboltoken": str(token),
-        "interval": interval,
-        "fromdate": from_date,
-        "todate": to_date,
-    }
+    try:
 
-    for attempt in range(1, MAX_RETRIES + 1):
+        if value is None:
+            return default
 
-        try:
+        if value == "":
+            return default
 
-            response = obj.getCandleData(params)
+        return float(value)
 
-            if response and response.get("data"):
-                return response["data"]
+    except Exception:
 
-            # Explicit Angel error
-            message = ""
+        return default
 
-            if response:
-                message = str(
-                    response.get("message", "")
-                )
 
-            if (
-                "access" in message.lower()
-                or "rate" in message.lower()
-                or "too many" in message.lower()
-            ):
-                wait = RETRY_BASE_SECONDS * attempt
+# ============================================================
+# CHUNK LIST
+# ============================================================
 
-                log(
-                    f"Rate limit [{label}] "
-                    f"attempt {attempt}/{MAX_RETRIES}. "
-                    f"Waiting {wait}s..."
-                )
+def chunked(
+    items,
+    size
+):
 
-                time.sleep(wait)
-                continue
+    for i in range(
+        0,
+        len(items),
+        size
+    ):
 
-            return None
+        yield items[
+            i:i + size
+        ]
 
-        except Exception as e:
 
-            error_text = str(e).lower()
+# ============================================================
+# EXTRACT BULK QUOTE DATA
+# ============================================================
 
-            rate_error = (
-                "403" in error_text
-                or "rate" in error_text
-                or "access denied" in error_text
-                or "too many requests" in error_text
+def extract_quote_items(
+    response
+):
+
+    if not isinstance(
+        response,
+        dict
+    ):
+
+        return []
+
+    data = response.get(
+        "data"
+    )
+
+    if isinstance(
+        data,
+        dict
+    ):
+
+        fetched = data.get(
+            "fetched"
+        )
+
+        if isinstance(
+            fetched,
+            list
+        ):
+
+            return fetched
+
+        nested = data.get(
+            "data"
+        )
+
+        if isinstance(
+            nested,
+            list
+        ):
+
+            return nested
+
+    if isinstance(
+        data,
+        list
+    ):
+
+        return data
+
+    return []
+
+
+# ============================================================
+# GET VOLUME FROM QUOTE
+# ============================================================
+
+def extract_volume(item):
+
+    possible_fields = [
+
+        "tradeVolume",
+
+        "tradevolume",
+
+        "volume",
+
+        "totalTradedVolume",
+
+        "totalTradedVolumeToday",
+
+    ]
+
+    for field in possible_fields:
+
+        if field in item:
+
+            value = safe_float(
+                item.get(field),
+                0
             )
 
-            if rate_error:
+            if value > 0:
 
-                wait = RETRY_BASE_SECONDS * attempt
+                return value
 
-                log(
-                    f"Rate limit exception [{label}] "
-                    f"attempt {attempt}/{MAX_RETRIES}. "
-                    f"Waiting {wait}s..."
-                )
-
-                time.sleep(wait)
-
-            else:
-
-                log(
-                    f"Candle error [{label}] "
-                    f"attempt {attempt}: {e}"
-                )
-
-                if attempt < MAX_RETRIES:
-                    time.sleep(2 * attempt)
-                else:
-                    return None
-
-    return None
+    return 0.0
 
 
-# -----------------------------
-# DAILY VOLUME SCAN
-# -----------------------------
+# ============================================================
+# GET LTP FROM QUOTE
+# ============================================================
 
-def scan_volume_stock(obj, symbol, token):
+def extract_ltp(item):
 
-    from_date = (
-        datetime.now() -
-        timedelta(days=DAILY_LOOKBACK_DAYS)
-    ).strftime("%Y-%m-%d %H:%M")
+    possible_fields = [
 
-    to_date = datetime.now().strftime(
-        "%Y-%m-%d %H:%M"
+        "ltp",
+
+        "LTP",
+
+        "lastTradedPrice",
+
+    ]
+
+    for field in possible_fields:
+
+        if field in item:
+
+            value = safe_float(
+                item.get(field),
+                0
+            )
+
+            if value > 0:
+
+                return value
+
+    return 0.0
+
+
+# ============================================================
+# FAST PHASE 1
+#
+# BULK CURRENT VOLUME
+# ============================================================
+
+def get_current_volume_bulk(
+    smart,
+    universe
+):
+
+    log("")
+    log("=" * 70)
+    log("PHASE 1 - FAST BULK CURRENT VOLUME SCAN")
+    log("=" * 70)
+
+    log(
+        f"NSE stocks: {len(universe)}"
     )
 
-    data = get_candles(
-        obj,
-        token,
-        "ONE_DAY",
-        from_date,
-        to_date,
-        label=f"{symbol} DAILY"
+    log(
+        f"Bulk batch size: "
+        f"{QUOTE_BATCH_SIZE}"
     )
 
-    if not data:
-        return None
-
-    df = candles_to_df(data)
-
-    if df is None or len(df) < 21:
-        return None
-
-    df = remove_incomplete_daily(df)
-
-    if df is None or len(df) < 21:
-        return None
-
-    last = df.iloc[-1]
-
-    close = float(last["close"])
-
-    if close < MIN_PRICE:
-        return None
-
-    avg_volume = (
-        df["volume"]
-        .tail(20)
-        .mean()
+    log(
+        f"Minimum current volume: "
+        f"{MIN_CURRENT_VOLUME:,}"
     )
 
-    if avg_volume <= 0:
-        return None
-
-    if avg_volume < MIN_AVG_VOLUME:
-        return None
-
-    volume_x = (
-        float(last["volume"]) /
-        float(avg_volume)
-    )
-
-    if volume_x < MIN_VOLUME_X:
-        return None
-
-    return {
-        "symbol": symbol,
-        "token": token,
-        "volume_x": volume_x,
-        "daily": df,
-    }
-
-
-# -----------------------------
-# PHASE 1
-# -----------------------------
-
-def phase_1_high_volume(obj, universe):
-
-    log("=" * 55)
-    log("PHASE 1: COMPLETE NSE HIGH-VOLUME SCAN")
-    log("=" * 55)
-
-    high_volume = []
+    volume_rows = []
 
     total = len(universe)
 
-    for index, (symbol, token) in enumerate(
+    processed = 0
+
+    batch_number = 0
+
+    for batch in chunked(
         universe,
-        start=1
+        QUOTE_BATCH_SIZE
     ):
 
-        result = scan_volume_stock(
-            obj,
-            symbol,
-            token
+        batch_number += 1
+
+        tokens = [
+            stock["token"]
+            for stock in batch
+        ]
+
+        payload = {
+
+            "mode": "FULL",
+
+            "exchangeTokens": {
+
+                "NSE": tokens
+
+            }
+
+        }
+
+        response = None
+
+        # ----------------------------------------------------
+        # First attempt
+        # ----------------------------------------------------
+
+        try:
+
+            response = smart.getMarketData(
+                payload
+            )
+
+        except Exception as exc:
+
+            log(
+                f"Bulk quote batch "
+                f"{batch_number} error: "
+                f"{exc}"
+            )
+
+        # ----------------------------------------------------
+        # Retry once
+        # ----------------------------------------------------
+
+        if response is None:
+
+            time.sleep(2)
+
+            try:
+
+                response = smart.getMarketData(
+                    payload
+                )
+
+            except Exception as exc:
+
+                log(
+                    f"Bulk quote retry failed "
+                    f"batch {batch_number}: "
+                    f"{exc}"
+                )
+
+                response = None
+
+        # ----------------------------------------------------
+        # Process response
+        # ----------------------------------------------------
+
+        items = extract_quote_items(
+            response
         )
 
-        if result:
-            high_volume.append(result)
+        by_token = {}
 
-            log(
-                f"HIGH VOLUME: {symbol} "
-                f"{result['volume_x']:.2f}x"
+        for item in items:
+
+            token = str(
+                item.get(
+                    "symbolToken",
+                    item.get(
+                        "symboltoken",
+                        ""
+                    )
+                )
+            ).strip()
+
+            if token:
+
+                by_token[token] = item
+
+        for stock in batch:
+
+            item = by_token.get(
+                stock["token"]
             )
 
-        if index % 50 == 0 or index == total:
-            log(
-                f"Phase 1 progress: "
-                f"{index}/{total} | "
-                f"High Volume: {len(high_volume)}"
+            if not item:
+                continue
+
+            volume = extract_volume(
+                item
             )
 
-        # Conservative pacing
-        time.sleep(REQUEST_DELAY)
-
-        if index % BATCH_SIZE == 0:
-            log(
-                f"Batch pause after {index} stocks..."
+            ltp = extract_ltp(
+                item
             )
-            time.sleep(BATCH_PAUSE)
 
-    high_volume.sort(
-        key=lambda x: x["volume_x"],
+            if volume < MIN_CURRENT_VOLUME:
+                continue
+
+            volume_rows.append({
+
+                **stock,
+
+                "current_volume": volume,
+
+                "ltp": ltp,
+
+            })
+
+        processed += len(batch)
+
+        if (
+            batch_number % 5 == 0
+            or processed >= total
+        ):
+
+            log(
+                f"Bulk progress: "
+                f"{processed}/{total} | "
+                f"Candidates: "
+                f"{len(volume_rows)}"
+            )
+
+        time.sleep(
+            QUOTE_DELAY
+        )
+
+    # --------------------------------------------------------
+    # Remove duplicates
+    # --------------------------------------------------------
+
+    unique = {}
+
+    for row in volume_rows:
+
+        unique[
+            row["symbol"]
+        ] = row
+
+    candidates = list(
+        unique.values()
+    )
+
+    # --------------------------------------------------------
+    # Sort by current volume
+    # --------------------------------------------------------
+
+    candidates.sort(
+        key=lambda x:
+        x["current_volume"],
         reverse=True
     )
 
-    top_list = high_volume[:TOP_VOLUME_COUNT]
+    # --------------------------------------------------------
+    # TOP 80
+    # --------------------------------------------------------
+
+    top_candidates = candidates[
+        :TOP_N
+    ]
+
+    log("")
+    log(
+        f"Bulk candidates: "
+        f"{len(candidates)}"
+    )
 
     log(
-        f"PHASE 1 COMPLETE: "
-        f"{len(high_volume)} high-volume stocks"
+        f"TOP {TOP_N} selected: "
+        f"{len(top_candidates)}"
     )
 
-    log(
-        f"Top {TOP_VOLUME_COUNT}: "
-        f"{len(top_list)} stocks"
+    return (
+        candidates,
+        top_candidates
     )
 
-    return top_list
 
+# ============================================================
+# RATE LIMIT DETECTOR
+# ============================================================
 
-# -----------------------------
-# GET FULL DAILY
-# -----------------------------
-
-def get_full_daily(obj, token, symbol):
-
-    from_date = (
-        datetime.now() -
-        timedelta(days=DAILY_HISTORY_DAYS)
-    ).strftime("%Y-%m-%d %H:%M")
-
-    to_date = datetime.now().strftime(
-        "%Y-%m-%d %H:%M"
-    )
-
-    data = get_candles(
-        obj,
-        token,
-        "ONE_DAY",
-        from_date,
-        to_date,
-        label=f"{symbol} FULL DAILY"
-    )
-
-    if not data:
-        return None
-
-    df = candles_to_df(data)
-
-    if df is None:
-        return None
-
-    df = remove_incomplete_daily(df)
-
-    return df
-
-
-# -----------------------------
-# GET WEEKLY
-# -----------------------------
-
-def get_weekly(obj, token, symbol):
-
-    from_date = (
-        datetime.now() -
-        timedelta(days=WEEKLY_HISTORY_DAYS)
-    ).strftime("%Y-%m-%d %H:%M")
-
-    to_date = datetime.now().strftime(
-        "%Y-%m-%d %H:%M"
-    )
-
-    data = get_candles(
-        obj,
-        token,
-        "ONE_WEEK",
-        from_date,
-        to_date,
-        label=f"{symbol} WEEKLY"
-    )
-
-    if not data:
-        return None
-
-    df = candles_to_df(data)
-
-    if df is None:
-        return None
-
-    return df
-
-
-# -----------------------------
-# PHASE 2
-# DAILY + WEEKLY SETUP
-# -----------------------------
-
-def phase_2_setup_scan(obj, top_volume_list):
-
-    log("=" * 55)
-    log("PHASE 2: DAILY + WEEKLY ANGEL API CHECK")
-    log("=" * 55)
-
-    picks = []
-
-    total = len(top_volume_list)
-
-    for index, item in enumerate(
-        top_volume_list,
-        start=1
-    ):
-
-        symbol = item["symbol"]
-        token = item["token"]
-
-        log(
-            f"[{index}/{total}] "
-            f"Reading Daily + Weekly: {symbol}"
-        )
-
-        # -------------------------
-        # FULL DAILY
-        # -------------------------
-
-        daily = get_full_daily(
-            obj,
-            token,
-            symbol
-        )
-
-        time.sleep(REQUEST_DELAY)
-
-        if daily is None or len(daily) < 200:
-            log(
-                f"{symbol}: insufficient daily data"
-            )
-            continue
-
-        # -------------------------
-        # WEEKLY
-        # -------------------------
-
-        weekly = get_weekly(
-            obj,
-            token,
-            symbol
-        )
-
-        time.sleep(REQUEST_DELAY)
-
-        if weekly is None or len(weekly) < 20:
-            log(
-                f"{symbol}: insufficient weekly data"
-            )
-            continue
-
-        # -------------------------
-        # DAILY INDICATORS
-        # -------------------------
-
-        last = daily.iloc[-1]
-
-        close = float(last["close"])
-        open_price = float(last["open"])
-        low = float(last["low"])
-
-        dma200 = (
-            daily["close"]
-            .rolling(200)
-            .mean()
-            .iloc[-1]
-        )
-
-        if pd.isna(dma200):
-            log(
-                f"{symbol}: 200 DMA unavailable"
-            )
-            continue
-
-        # -------------------------
-        # 52 WEEK HIGH
-        # -------------------------
-
-        last_252 = daily.tail(252)
-
-        if len(last_252) == 0:
-            continue
-
-        high_52w = float(
-            last_252["high"].max()
-        )
-
-        # -------------------------
-        # WEEKLY TREND
-        # -------------------------
-
-        weekly_close = float(
-            weekly["close"].iloc[-1]
-        )
-
-        weekly_up = (
-            weekly_close > float(dma200)
-        )
-
-        # -------------------------
-        # NEAR 52W HIGH
-        # -------------------------
-
-        near_52w_high = (
-            close >=
-            high_52w * NEAR_52W_PERCENT
-        )
-
-        # -------------------------
-        # GREEN DAILY CANDLE
-        # -------------------------
-
-        green = close > open_price
-
-        # -------------------------
-        # FINAL SETUP
-        # -------------------------
-
-        if (
-            weekly_up
-            and near_52w_high
-            and green
-        ):
-
-            target_1 = close * 1.05
-            target_2 = close * 1.08
-
-            picks.append(
-                {
-                    "Stock": symbol,
-                    "LTP": round(close, 2),
-                    "52W": round(high_52w, 2),
-                    "VolX": round(
-                        float(item["volume_x"]),
-                        2
-                    ),
-                    "SL": round(low, 2),
-                    "TGT1": round(
-                        target_1,
-                        2
-                    ),
-                    "TGT2": round(
-                        target_2,
-                        2
-                    ),
-                    "DMA200": round(
-                        float(dma200),
-                        2
-                    ),
-                }
-            )
-
-            log(
-                f"BUY FOUND: {symbol} | "
-                f"Vol {item['volume_x']:.2f}x | "
-                f"LTP {close:.2f}"
-            )
-
-        else:
-
-            log(
-                f"{symbol}: No setup"
-            )
-
-        # Additional batch pause
-        if index % BATCH_SIZE == 0:
-            log(
-                f"Phase 2 batch pause..."
-            )
-            time.sleep(BATCH_PAUSE)
-
-    return picks
-
-
-# -----------------------------
-# TELEGRAM MESSAGE
-# -----------------------------
-
-def build_message(
-    total_nse,
-    high_volume_count,
-    picks
+def is_rate_limit_error(
+    exc
 ):
 
-    timestamp = datetime.now().strftime(
-        "%d %b %Y %I:%M %p"
+    text = str(
+        exc
+    ).lower()
+
+    keywords = [
+
+        "exceeding access rate",
+
+        "access denied",
+
+        "403",
+
+        "429",
+
+        "rate limit",
+
+        "too many requests",
+
+    ]
+
+    for keyword in keywords:
+
+        if keyword in text:
+
+            return True
+
+    return False
+
+
+# ============================================================
+# GET DAILY CANDLES
+# ============================================================
+
+def get_daily_candles(
+    smart,
+    token
+):
+
+    # Current time
+    now = datetime.now(
+        IST
     )
 
-    if not picks:
+    # We intentionally stop at yesterday.
+    #
+    # This prevents today's incomplete candle
+    # from becoming a swing signal.
 
-        return (
-            f"📉 PURA NSE SWING SCAN\n\n"
-            f"Time: {timestamp}\n"
-            f"Total NSE Stocks: {total_nse}\n"
-            f"High Volume 2x+: {high_volume_count}\n"
-            f"Final Setup: 0\n\n"
-            f"Daily + Weekly confirmation ke baad "
-            f"aaj koi setup nahi mila."
-        )
+    yesterday = (
+        now - timedelta(days=1)
+    ).date()
 
-    df = pd.DataFrame(picks)
-
-    df = df.sort_values(
-        by="VolX",
-        ascending=False
-    )
-
-    message = (
-        f"🚀 PURA NSE SWING BUY\n\n"
-        f"Time: {timestamp}\n"
-        f"Total NSE Stocks: {total_nse}\n"
-        f"High Volume 2x+: {high_volume_count}\n"
-        f"BUY Setup: {len(df)}\n\n"
-    )
-
-    for _, row in df.iterrows():
-
-        message += (
-            f"📌 {row['Stock']}\n"
-            f"LTP: ₹{row['LTP']}\n"
-            f"52W High: ₹{row['52W']}\n"
-            f"Volume: {row['VolX']}x\n"
-            f"200 DMA: ₹{row['DMA200']}\n"
-            f"SL: ₹{row['SL']}\n"
-            f"T1: ₹{row['TGT1']}\n"
-            f"T2: ₹{row['TGT2']}\n\n"
-        )
-
-    message += (
-        "⚠️ Scanner signal only. "
-        "No automatic order placement."
-    )
-
-    return message
-
-
-# -----------------------------
-# MAIN
-# -----------------------------
-
-def main():
-
-    start_time = time.time()
-
-    log("=" * 60)
-    log("CHANDAN PURA NSE HIGH-VOLUME SWING SCANNER")
-    log("=" * 60)
-
-    validate_secrets()
-
-    # -------------------------
-    # LOGIN
-    # -------------------------
-
-    obj = login_angel()
-
-    # -------------------------
-    # NSE UNIVERSE
-    # -------------------------
-
-    universe = load_nse_universe()
-
-    if not universe:
-        raise RuntimeError(
-            "NSE universe is empty."
-        )
-
-    # -------------------------
-    # PHASE 1
-    # -------------------------
-
-    top_volume_list = phase_1_high_volume(
-        obj,
-        universe
-    )
-
-    if not top_volume_list:
-
-        message = (
-            f"📉 PURA NSE SCAN\n\n"
-            f"Total NSE Stocks: {len(universe)}\n"
-            f"High Volume 2x+: 0\n"
-            f"Final Setup: 0\n\n"
-            f"Aaj koi stock 2x volume condition "
-            f"pass nahi hua."
-        )
-
-        print(message, flush=True)
-        send_telegram(message)
-        return
-
-    log(
-        "Top volume stocks: "
-        + ", ".join(
-            x["symbol"]
-            for x in top_volume_list[:20]
+    start_date = (
+        yesterday
+        - timedelta(
+            days=DAILY_LOOKBACK_DAYS
         )
     )
 
-    # -------------------------
-    # PHASE 2
-    # -------------------------
+    params = {
 
-    picks = phase_2_setup_scan(
-        obj,
-        top_volume_list
-    )
+        "exchange": "NSE",
 
-    # -------------------------
-    # TELEGRAM
-    # -------------------------
+        "symboltoken": str(
+            token
+        ),
 
-    message = build_message(
-        total_nse=len(universe),
-        high_volume_count=len(top_volume_list),
-        picks=picks
-    )
+        "interval": "ONE_DAY",
 
-    print("\n" + message, flush=True)
+        "fromdate":
+            f"{start_date.isoformat()} 09:15",
 
-    send_telegram(message)
+        "todate":
+            f"{yesterday.isoformat()} 15:30",
 
-    elapsed = (
-        time.time() -
-        start_time
-    )
+    }
 
-    log(
-        f"DONE - Scan completed in "
-        f"{elapsed / 60:.1f} minutes"
-    )
+    for attempt in range(
+        1,
+        MAX_HIST_RETRIES + 1
+    ):
 
+        try:
 
-if __name__ == "__main__":
-    main()
+            response = smart.getCandleData(
+                params
+            )
+
+            if not isinstance(
+                response,
+                dict
+            ):
+
+                raise RuntimeError(
+                    f"Unexpected candle response: "
+                    f"{response}"
+                )
+
+            if not response.get(
+                "status"
+            ):
+
+                message = response.get(
+                    "message",
+                    response.get(
+                        "errorcode",
+                        "Unknown candle error"
+                    )
+                )
+
+                raise RuntimeError(
+                    str(message)
+                )
+
+            data = response.get(
+                "data"
+            ) or []
+
+            if not data:
+
+                return None
+
+            df = pd.DataFrame(
+
+                data,
+
+                columns=[
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ]
+
+            )
+
+            # ------------------------------------------------
+            # Numeric conversion
+            # ------------------------------------------------
+
+            numeric_columns = [
+
+                "open",
+
+                "high",
+
+                "low",
+
+                "close",
+
+                "volume",
+
+            ]
+
+            for column in numeric_columns:
+
+                df[column] = pd.to_numeric(
+
+                    df[column],
+
+                    errors="coerce"
+
+                )
+
+            # ------------------------------------------------
+            # Date conversion
+            # ------------------------------------------------
+
+            df["date"] = pd.to_datetime(
+
+                df["date"],
+
+                errors="coerce"
+
+            )
+
+            # ------------------------------------------------
+            # Remove invalid rows
+            # ------------------------------------------------
+
+            df = df.dropna(
+
+                subset=[
+
+                    "date",
+
+                    "open",
+
+                    "high",
+
+                    "low",
+
+                    "close",
+
+                    "volume",
+
+                ]
+
+            )
+
+            # ------------------------------------------------
+            # Sort
+            # ------------------------------------------------
+
+            df = df.sort_values(
+                "date"
+            )
+
+            df = df.drop_duplicates(
+                subset=["date"],
+                keep="last"
+            )
+
+            df = df.reset_index(
+                drop=True
+            )
+
+            # ------------------------------------------------
+            # Safety:
+            # never use today's candle
+            # ------------------------------------------------
+
+            today = datetime.now(
+                IST
+            ).date()
+
+            df = df[
+                df["date"].dt.date
+                < today
+            ].copy()
+
+            # Need at least 200+ candles
+            if len(df) < 205:
+
+                return None
+
+            return df
+
+        except Exception as exc:
+
+            # Last attempt
+            if attempt >= MAX_HIST_RETRIES:
+
+                log(
+                    "Historical API failed after "
+                    f"{MAX_HIST_RETRIES} attempts: "
+                    f"{exc}"
+                )
+
+                return None
+
+            # ----------------------------
