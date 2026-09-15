@@ -2,7 +2,7 @@ name: Dwija Run
 
 on:
   schedule:
-    - cron: '0 12 * * 1-5'  # 5:30 PM IST - Speed fast
+    - cron: '0 12 * * 1-5'  # 5:30 PM IST
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install smartapi-python pyotp pandas requests
+          pip install smartapi-python pyotp pandas requests logzero
 
       - name: Run python scanner.py
         env:
