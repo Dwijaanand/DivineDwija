@@ -2,9 +2,9 @@ import os,time,requests,pyotp,pandas as pd
 from datetime import datetime,timedelta
 from SmartApi import SmartConnect
 
-API=os.getenv("API_KEY"); CID=os.getenv("CLIENT_ID")
-PWD=os.getenv("PASSWORD"); TOTP=os.getenv("TOTP_SECRET")
-TG=os.getenv("TELEGRAM_BOT_TOKEN"); CHAT=os.getenv("TELEGRAM_CHAT_ID")
+API=os.getenv("API_KEY");CID=os.getenv("CLIENT_ID")
+PWD=os.getenv("PASSWORD");TOTP=os.getenv("TOTP_SECRET")
+TG=os.getenv("TELEGRAM_BOT_TOKEN");CHAT=os.getenv("TELEGRAM_CHAT_ID")
 
 MASTER="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
@@ -25,8 +25,7 @@ def telegram(msg):
     if not TG or not CHAT:return
     try:
         requests.post(f"https://api.telegram.org/bot{TG}/sendMessage",
-                      data={"chat_id":CHAT,"text":msg,"parse_mode":"Markdown"},
-                      timeout=15)
+            data={"chat_id":CHAT,"text":msg,"parse_mode":"Markdown"},timeout=15)
     except Exception as e:
         print("Telegram error:",e,flush=True)
 
@@ -71,7 +70,6 @@ def clean_daily(df):
             df[c]=pd.to_numeric(df[c],errors="coerce")
         df=df.dropna(subset=["time","open","high","low","close","volume"])
         df=df.sort_values("time").drop_duplicates("time",keep="last")
-        # Before 3:30 PM remove today's incomplete candle
         if not market_closed() and len(df):
             if df["time"].iloc[-1].date()==datetime.now().date():
                 df=df.iloc[:-1]
@@ -85,7 +83,6 @@ def weekly(df):
         w=df.copy().set_index("time").resample("W-FRI").agg({
             "open":"first","high":"max","low":"min","close":"last","volume":"sum"
         }).dropna()
-        # Remove current incomplete week
         if not market_closed() and len(w):
             today=datetime.now()
             friday=today+timedelta(days=4-today.weekday())
@@ -123,10 +120,27 @@ def bulk_quotes(tokens):
         print(f"Bulk quote {min(i+50,len(tokens))}/{len(tokens)}",flush=True)
     return out
 
+def rank_score(r):
+    # CORE STRATEGY LOCKED.
+    # Sirf qualified BUY signals ki strength ranking.
+    near_score=max(0,min(40,(8-r["HighDist"])/8*40))
+    vol_score=max(0,min(30,(r["VolX"]-2)/8*30+5))
+    weekly_score=15 if r["WeeklyUp"] else 0
+    green_score=10 if r["Green"] else 0
+    return near_score+vol_score+weekly_score+green_score
+
+def stars(score):
+    if score>=80:return "★★★★★"
+    if score>=68:return "★★★★☆"
+    if score>=55:return "★★★☆☆"
+    if score>=42:return "★★☆☆☆"
+    return "★☆☆☆☆"
+
 print("\n======================================")
-print(" ANGEL ONE SWING SCANNER V3.4.9 FIXED")
+print(" ANGEL ONE SWING SCANNER V3.5")
 print("======================================",flush=True)
 print("Core strategy: LOCKED",flush=True)
+print("Ranking: STRONGEST SETUP FIRST",flush=True)
 print("Auto orders: DISABLED",flush=True)
 print("Mode: FINAL DAILY CANDLE" if market_closed() else "Mode: PRE-CLOSE - TODAY CANDLE PROTECTED",flush=True)
 
@@ -194,13 +208,12 @@ for n,x in enumerate(candidates,1):
     print(f"[{n}/{len(candidates)}] {x['sym']}",flush=True)
 
     df=clean_daily(hist(x["token"]))
-
     if df is None or len(df)<200:
         continue
 
     last=df.iloc[-1]
-
     avg20=df["volume"].iloc[-21:-1].mean()
+
     if not avg20 or avg20<MIN_AVG20:
         continue
 
@@ -234,23 +247,36 @@ for n,x in enumerate(candidates,1):
 
     weekly_up=weekly_close>weekly_sma
 
+    # CORE BUY CONDITION - UNCHANGED
     if weekly_up and near_high and green:
+        high_dist=max(0,(float(high52)-close)/float(high52)*100)
         t1=close*1.05
         t2=close*1.08
-        picks.append({
+
+        r={
             "Stock":x["sym"],
             "LTP":close,
             "52W":float(high52),
             "VolX":volx,
             "SL":low,
             "T1":t1,
-            "T2":t2
-        })
-        print(f"   BUY FOUND: {x['sym']} Vol {volx:.2f}x",flush=True)
+            "T2":t2,
+            "HighDist":high_dist,
+            "WeeklyUp":weekly_up,
+            "Green":green
+        }
+        r["RankScore"]=rank_score(r)
+        picks.append(r)
+        print(f"   BUY FOUND: {x['sym']} Vol {volx:.2f}x RankScore {r['RankScore']:.1f}",flush=True)
 
     time.sleep(DELAY)
 
-picks.sort(key=lambda x:x["VolX"],reverse=True)
+# STRONGEST QUALIFIED SETUP FIRST
+picks.sort(key=lambda x:x["RankScore"],reverse=True)
+
+for i,r in enumerate(picks,1):
+    r["Rank"]=i
+    r["Stars"]=stars(r["RankScore"])
 
 now=datetime.now().strftime("%d %b %I:%M %p")
 mode="Completed Daily Candle" if market_closed() else "Previous Completed Daily Candle"
@@ -267,13 +293,17 @@ else:
          f"Total NSE: {len(stocks)}\n"
          f"Top Candidates: {len(candidates)}\n"
          f"BUY: {len(picks)}\n\n"
-         f"Mode: {mode}\n\n")
+         f"Mode: {mode}\n"
+         f"Ranking: Strongest Setup First\n\n")
+
     for r in picks:
-        msg+=(f"*{r['Stock']}*\n"
-              f"LTP: ₹{r['LTP']:.2f} | 52W: ₹{r['52W']:.2f}\n"
-              f"Vol: {r['VolX']:.2f}x | SL: ₹{r['SL']:.2f}\n"
-              f"TGT: ₹{r['T1']:.2f} / ₹{r['T2']:.2f}\n\n")
+        msg+=(f"*#{r['Rank']} {r['Stock']} {r['Stars']}*\n"
+              f"LTP: ₹{r['LTP']:.2f}\n"
+              f"SL: ₹{r['SL']:.2f}\n"
+              f"TGT: ₹{r['T1']:.2f} / ₹{r['T2']:.2f}\n"
+              f"Vol: {r['VolX']:.2f}x\n"
+              f"52W: ₹{r['52W']:.2f}\n\n")
 
 print("\n"+msg,flush=True)
 telegram(msg)
-print("\nDONE - V3.4.9 FIXED NSE SCAN COMPLETE",flush=True)
+print("\nDONE - V3.5 NSE SCAN COMPLETE",flush=True)
