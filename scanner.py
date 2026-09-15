@@ -13,7 +13,7 @@ MIN_LTP=50
 MIN_VOL=100000
 MIN_AVG20=50000
 MIN_VOLX=2.0
-HISTORY=380
+HISTORY=760
 DELAY=.7
 RETRIES=4
 WAIT=8
@@ -88,9 +88,32 @@ def weekly(df):
             friday=today+timedelta(days=4-today.weekday())
             if w.index[-1].date()>=friday.date():
                 w=w.iloc[:-1]
-        return w
+        return w.reset_index()
     except:
         return None
+
+def monthly(df):
+    try:
+        m=df.copy().set_index("time").resample("ME").agg({
+            "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+        }).dropna()
+        if not market_closed() and len(m):
+            today=datetime.now()
+            if m.index[-1].year==today.year and m.index[-1].month==today.month:
+                m=m.iloc[:-1]
+        return m.reset_index()
+    except:
+        try:
+            m=df.copy().set_index("time").resample("M").agg({
+                "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+            }).dropna()
+            if not market_closed() and len(m):
+                today=datetime.now()
+                if m.index[-1].year==today.year and m.index[-1].month==today.month:
+                    m=m.iloc[:-1]
+            return m.reset_index()
+        except:
+            return None
 
 def bulk_quotes(tokens):
     out={}
@@ -120,29 +143,40 @@ def bulk_quotes(tokens):
         print(f"Bulk quote {min(i+50,len(tokens))}/{len(tokens)}",flush=True)
     return out
 
-def rank_score(r):
-    # CORE STRATEGY LOCKED.
-    # Sirf qualified BUY signals ki strength ranking.
-    near_score=max(0,min(40,(8-r["HighDist"])/8*40))
-    vol_score=max(0,min(30,(r["VolX"]-2)/8*30+5))
+def mtf_score(r):
+    # Ranking only. BUY condition remains unchanged.
+    # 35 = 52W proximity
+    # 25 = volume expansion
+    # 15 = monthly trend
+    # 15 = weekly trend
+    # 10 = daily candle strength
+
+    high_score=max(0,min(35,(8-r["HighDist"])/8*35))
+    vol_score=max(0,min(25,(r["VolX"]-2)/8*25))
+    monthly_score=15 if r["MonthlyUp"] else 0
     weekly_score=15 if r["WeeklyUp"] else 0
-    green_score=10 if r["Green"] else 0
-    return near_score+vol_score+weekly_score+green_score
+
+    body=r["LTP"]-r["Open"]
+    rng=max(r["High"]-r["Low"],0.01)
+    candle_strength=max(0,min(10,(body/rng)*10)) if body>0 else 0
+
+    return high_score+vol_score+monthly_score+weekly_score+candle_strength
 
 def stars(score):
-    if score>=80:return "★★★★★"
-    if score>=68:return "★★★★☆"
-    if score>=55:return "★★★☆☆"
-    if score>=42:return "★★☆☆☆"
+    if score>=85:return "★★★★★"
+    if score>=72:return "★★★★☆"
+    if score>=60:return "★★★☆☆"
+    if score>=48:return "★★☆☆☆"
     return "★☆☆☆☆"
 
 print("\n======================================")
-print(" ANGEL ONE SWING SCANNER V3.5")
+print(" ANGEL ONE SWING SCANNER V3.6 MTF")
 print("======================================",flush=True)
 print("Core strategy: LOCKED",flush=True)
-print("Ranking: STRONGEST SETUP FIRST",flush=True)
+print("Monthly + Weekly + Daily: ENABLED",flush=True)
+print("Ranking: MTF STRONGEST SETUP FIRST",flush=True)
 print("Auto orders: DISABLED",flush=True)
-print("Mode: FINAL DAILY CANDLE" if market_closed() else "Mode: PRE-CLOSE - TODAY CANDLE PROTECTED",flush=True)
+print("Mode: COMPLETED DAILY CANDLE" if market_closed() else "Mode: PRE-CLOSE - TODAY CANDLE PROTECTED",flush=True)
 
 if not API or not CID or not PWD or not TOTP:
     print("ERROR: Missing Angel credentials",flush=True)
@@ -201,13 +235,14 @@ candidates=candidates[:TOP]
 print(f"PHASE 1 DONE: {len(candidates)} candidates / {len(stocks)} NSE stocks",flush=True)
 print("TOP:",[x["sym"] for x in candidates[:10]],flush=True)
 
-print("\nPHASE 2: DAILY + WEEKLY CHECK...",flush=True)
+print("\nPHASE 2: MONTHLY + WEEKLY + DAILY CHECK...",flush=True)
 picks=[]
 
 for n,x in enumerate(candidates,1):
     print(f"[{n}/{len(candidates)}] {x['sym']}",flush=True)
 
     df=clean_daily(hist(x["token"]))
+
     if df is None or len(df)<200:
         continue
 
@@ -218,6 +253,7 @@ for n,x in enumerate(candidates,1):
         continue
 
     volx=float(last["volume"])/float(avg20)
+
     if volx<MIN_VOLX:
         continue
 
@@ -229,12 +265,15 @@ for n,x in enumerate(candidates,1):
 
     close=float(last["close"])
     openp=float(last["open"])
+    high=float(last["high"])
     low=float(last["low"])
 
     near_high=close>=float(high52)*.92
     green=close>openp
 
+    # EXISTING CORE WEEKLY CONFIRMATION
     w=weekly(df)
+
     if w is None or len(w)<40:
         continue
 
@@ -247,6 +286,22 @@ for n,x in enumerate(candidates,1):
 
     weekly_up=weekly_close>weekly_sma
 
+    # NEW MONTHLY READING - RANKING ONLY
+    m=monthly(df)
+
+    if m is None or len(m)<12:
+        monthly_up=False
+    else:
+        m["sma10"]=m["close"].rolling(10).mean()
+        mc=float(m["close"].iloc[-1])
+        ms=float(m["sma10"].iloc[-1])
+
+        monthly_up=False if pd.isna(ms) else mc>ms
+
+        if len(m)>=3:
+            monthly_slope=float(m["sma10"].iloc[-1])-float(m["sma10"].iloc[-3])
+            monthly_up=monthly_up and monthly_slope>=0
+
     # CORE BUY CONDITION - UNCHANGED
     if weekly_up and near_high and green:
         high_dist=max(0,(float(high52)-close)/float(high52)*100)
@@ -256,54 +311,72 @@ for n,x in enumerate(candidates,1):
         r={
             "Stock":x["sym"],
             "LTP":close,
+            "Open":openp,
+            "High":high,
+            "Low":low,
             "52W":float(high52),
             "VolX":volx,
             "SL":low,
             "T1":t1,
             "T2":t2,
             "HighDist":high_dist,
-            "WeeklyUp":weekly_up,
-            "Green":green
+            "MonthlyUp":monthly_up,
+            "WeeklyUp":weekly_up
         }
-        r["RankScore"]=rank_score(r)
+
+        r["Score"]=mtf_score(r)
         picks.append(r)
-        print(f"   BUY FOUND: {x['sym']} Vol {volx:.2f}x RankScore {r['RankScore']:.1f}",flush=True)
+
+        print(
+            f"   BUY FOUND: {x['sym']} "
+            f"Vol {volx:.2f}x "
+            f"52Wdist {high_dist:.2f}% "
+            f"MTF {r['Score']:.1f}",
+            flush=True
+        )
 
     time.sleep(DELAY)
 
-# STRONGEST QUALIFIED SETUP FIRST
-picks.sort(key=lambda x:x["RankScore"],reverse=True)
+# STRONGEST MTF SETUP FIRST
+picks.sort(key=lambda x:x["Score"],reverse=True)
 
 for i,r in enumerate(picks,1):
     r["Rank"]=i
-    r["Stars"]=stars(r["RankScore"])
+    r["Stars"]=stars(r["Score"])
 
 now=datetime.now().strftime("%d %b %I:%M %p")
 mode="Completed Daily Candle" if market_closed() else "Previous Completed Daily Candle"
 
 if not picks:
-    msg=(f"📉 *PURA NSE SCAN - {now}*\n\n"
-         f"Total NSE: {len(stocks)}\n"
-         f"Top Candidates: {len(candidates)}\n"
-         f"Final BUY: 0\n\n"
-         f"Mode: {mode}\n\n"
-         f"_Aaj qualifying setup nahi mila._")
+    msg=(
+        f"📉 *PURA NSE SCAN - {now}*\n\n"
+        f"Total NSE: {len(stocks)}\n"
+        f"Top Candidates: {len(candidates)}\n"
+        f"Final BUY: 0\n\n"
+        f"Mode: {mode}\n"
+        f"MTF: Monthly + Weekly + Daily\n\n"
+        f"_Aaj qualifying setup nahi mila._"
+    )
 else:
-    msg=(f"🚀 *PURA NSE BUY - {now}* 🚀\n\n"
-         f"Total NSE: {len(stocks)}\n"
-         f"Top Candidates: {len(candidates)}\n"
-         f"BUY: {len(picks)}\n\n"
-         f"Mode: {mode}\n"
-         f"Ranking: Strongest Setup First\n\n")
+    msg=(
+        f"🚀 *PURA NSE BUY - {now}* 🚀\n\n"
+        f"Total NSE: {len(stocks)}\n"
+        f"Top Candidates: {len(candidates)}\n"
+        f"BUY: {len(picks)}\n\n"
+        f"Mode: {mode}\n"
+        f"Ranking: MTF Strongest Setup First\n\n"
+    )
 
     for r in picks:
-        msg+=(f"*#{r['Rank']} {r['Stock']} {r['Stars']}*\n"
-              f"LTP: ₹{r['LTP']:.2f}\n"
-              f"SL: ₹{r['SL']:.2f}\n"
-              f"TGT: ₹{r['T1']:.2f} / ₹{r['T2']:.2f}\n"
-              f"Vol: {r['VolX']:.2f}x\n"
-              f"52W: ₹{r['52W']:.2f}\n\n")
+        msg+=(
+            f"*#{r['Rank']} {r['Stock']} {r['Stars']}*\n"
+            f"LTP: ₹{r['LTP']:.2f}\n"
+            f"SL: ₹{r['SL']:.2f}\n"
+            f"TGT: ₹{r['T1']:.2f} / ₹{r['T2']:.2f}\n"
+            f"Vol: {r['VolX']:.2f}x\n"
+            f"52W: ₹{r['52W']:.2f}\n\n"
+        )
 
 print("\n"+msg,flush=True)
 telegram(msg)
-print("\nDONE - V3.5 NSE SCAN COMPLETE",flush=True)
+print("\nDONE - V3.6 MTF NSE SCAN COMPLETE",flush=True)
