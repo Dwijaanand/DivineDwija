@@ -1,4 +1,4 @@
-import os,time,requests,signal,json
+import os,time,requests,signal,subprocess
 import pandas as pd
 from datetime import datetime,timedelta
 from zoneinfo import ZoneInfo
@@ -22,8 +22,6 @@ STOCK_DELAY=2.0
 RATE_WAIT=45
 MAX_RETRY=1
 BATCH=50
-CHUNK=2*1024*1024
-
 EXCLUDED={"LTIM","TATAMOTORS"}
 
 API_KEY=os.getenv("API_KEY","").strip()
@@ -85,189 +83,120 @@ def login():
     fail("Angel One login failed.")
 
 def download_master(url):
-    tmp="/tmp/angel_master.tmp"
+    tmp="/tmp/OpenAPIScripMaster.json"
 
     try:
         if os.path.exists(tmp):
             os.remove(tmp)
 
-        h={
-            "User-Agent":"Mozilla/5.0",
-            "Accept":"application/json",
-            "Accept-Encoding":"identity",
-            "Connection":"keep-alive"
-        }
+        log("Downloading master with curl...")
+        log("No Range/chunk mode.")
 
-        log("Checking master server...")
+        cmd=[
+            "curl","-L","--fail",
+            "--retry","8",
+            "--retry-delay","5",
+            "--retry-max-time","240",
+            "--retry-connrefused",
+            "--retry-all-errors",
+            "--connect-timeout","20",
+            "--max-time","240",
+            "-A","Mozilla/5.0",
+            "-H","Accept: application/json",
+            "-o",tmp,
+            url
+        ]
 
-        total=None
+        p=subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300
+        )
 
-        try:
-            hr=requests.head(url,headers=h,timeout=(15,30),allow_redirects=True)
-            cl=hr.headers.get("Content-Length")
-            if cl:
-                total=int(cl)
-        except Exception as e:
-            log("HEAD unavailable: "+str(e))
-
-        if not total:
-            try:
-                rr=requests.get(
-                    url,
-                    headers={**h,"Range":"bytes=0-0"},
-                    timeout=(15,30),
-                    stream=True
-                )
-                cr=rr.headers.get("Content-Range","")
-                if "/" in cr:
-                    total=int(cr.split("/")[-1])
-                rr.close()
-            except Exception as e:
-                log("Range check error: "+str(e))
-
-        if total:
-            log(f"Master size: {total/1024/1024:.1f} MB")
-        else:
-            log("Master size unknown. Using normal download.")
-
-        if not total:
-            for a in range(1,4):
-                try:
-                    log(f"Full master download {a}/3...")
-                    r=requests.get(
-                        url,
-                        headers=h,
-                        timeout=(15,180),
-                        stream=True
-                    )
-                    r.raise_for_status()
-
-                    with open(tmp,"wb") as f:
-                        for part in r.iter_content(1024*1024):
-                            if part:f.write(part)
-
-                    with open(tmp,"rb") as f:
-                        data=json.load(f)
-
-                    if isinstance(data,list) and len(data)>1000:
-                        log(f"Master OK: {len(data)} instruments")
-                        return data
-
-                except Exception as e:
-                    log("Full download error: "+str(e))
-                    time.sleep(5)
-
+        if p.returncode!=0:
+            log("curl failed:")
+            log(p.stdout[-1000:])
             return None
 
-        start=0
-
-        while start<total:
-            end=min(start+CHUNK-1,total-1)
-            ok=False
-
-            for a in range(1,5):
-                try:
-                    log(
-                        f"Master chunk "
-                        f"{start/1024/1024:.1f}-{end/1024/1024:.1f} MB"
-                    )
-
-                    headers={
-                        **h,
-                        "Range":f"bytes={start}-{end}"
-                    }
-
-                    r=requests.get(
-                        url,
-                        headers=headers,
-                        timeout=(15,90),
-                        stream=True
-                    )
-
-                    if r.status_code not in (200,206):
-                        raise Exception(
-                            f"HTTP {r.status_code}"
-                        )
-
-                    if start>0 and r.status_code==200:
-                        raise Exception(
-                            "Server ignored Range request"
-                        )
-
-                    got=0
-
-                    with open(tmp,"ab") as f:
-                        for part in r.iter_content(256*1024):
-                            if part:
-                                f.write(part)
-                                got+=len(part)
-
-                    r.close()
-
-                    expected=end-start+1
-
-                    if got!=expected:
-                        raise Exception(
-                            f"Incomplete chunk: {got}/{expected}"
-                        )
-
-                    start=end+1
-                    ok=True
-                    break
-
-                except Exception as e:
-                    log("Chunk error: "+str(e))
-                    time.sleep(3)
-
-            if not ok:
-                log("Chunk failed. Trying next master URL...")
-                return None
+        if not os.path.exists(tmp):
+            log("Master file not created.")
+            return None
 
         size=os.path.getsize(tmp)
+        log(f"Downloaded: {size/1024/1024:.1f} MB")
 
-        if size!=total:
-            log(f"Master size mismatch: {size}/{total}")
+        if size<1000000:
+            log("Master file too small.")
             return None
 
-        log("Master download completed.")
+        log("Validating JSON...")
 
-        with open(tmp,"rb") as f:
-            data=json.load(f)
+        try:
+            import json
+            with open(tmp,"r",encoding="utf-8") as f:
+                data=json.load(f)
+        except Exception as e:
+            log("JSON validation failed: "+str(e))
+            return None
 
-        if isinstance(data,list) and len(data)>1000:
-            log(f"Master JSON valid: {len(data)} instruments")
-            return data
+        if not isinstance(data,list):
+            log("Master JSON is not a list.")
+            return None
+
+        if len(data)<1000:
+            log(f"Master has only {len(data)} records.")
+            return None
+
+        log(f"✅ Master JSON valid: {len(data)} instruments")
+        return data
+
+    except subprocess.TimeoutExpired:
+        log("Master download timeout.")
+        return None
 
     except Exception as e:
-        log("Master download fatal: "+str(e))
-
-    return None
+        log("Master download error: "+str(e))
+        return None
 
 def load_master():
     log("\nLoading NSE master...")
 
     data=None
 
-    for url in MASTER_URLS:
-        log("Trying: "+url)
+    for n,url in enumerate(MASTER_URLS,1):
+        log(f"\nMaster server {n}/{len(MASTER_URLS)}")
+        log(url)
+
         data=download_master(url)
 
         if data:
             break
 
+        log("Trying next master server...")
+        time.sleep(3)
+
     if not data:
-        fail("NSE master download failed after retries.")
+        fail(
+            "NSE master download failed.\n"
+            "Both Angel One master URLs failed."
+        )
 
     out={}
 
     for x in data:
         try:
-            seg=str(x.get("exch_seg","")).lower().strip()
+            seg=str(
+                x.get("exch_seg","")
+            ).lower().strip()
 
             if seg not in ("nse","nse_cm"):
                 continue
 
-            raw=str(x.get("symbol","")).strip()
+            raw=str(
+                x.get("symbol","")
+            ).strip()
 
             if not raw.upper().endswith("-EQ"):
                 continue
@@ -277,7 +206,9 @@ def load_master():
             if not sym or sym in EXCLUDED:
                 continue
 
-            token=str(x.get("token","")).strip()
+            token=str(
+                x.get("token","")
+            ).strip()
 
             if token:
                 out[sym]=token
@@ -288,7 +219,9 @@ def load_master():
     log(f"✅ NSE-EQ stocks loaded: {len(out)}")
 
     if len(out)<100:
-        fail("NSE-EQ symbols not found in master.")
+        fail(
+            "NSE-EQ stocks not found in master."
+        )
 
     return out
 
@@ -306,7 +239,11 @@ def bulk_quotes(api,tokens):
                 )
 
                 if r and r.get("status"):
-                    rows=r.get("data",{}).get("fetched",[])
+                    rows=r.get(
+                        "data",{}
+                    ).get(
+                        "fetched",[]
+                    )
                     result.extend(rows)
                     break
 
@@ -330,15 +267,23 @@ def phase1(api,master):
 
     for q in rows:
         try:
-            token=str(q.get("symbolToken",""))
+            token=str(
+                q.get("symbolToken","")
+            )
             sym=reverse.get(token,"")
 
             if not sym:
                 continue
 
-            ltp=float(q.get("ltp",0) or 0)
+            ltp=float(
+                q.get("ltp",0) or 0
+            )
+
             vol=float(
-                q.get("tradeVolume",q.get("volume",0)) or 0
+                q.get(
+                    "tradeVolume",
+                    q.get("volume",0)
+                ) or 0
             )
 
             if ltp<MIN_LTP or vol<MIN_VOL:
@@ -373,8 +318,12 @@ def candle(api,token):
         "exchange":"NSE",
         "symboltoken":str(token),
         "interval":"ONE_DAY",
-        "fromdate":from_dt.strftime("%Y-%m-%d %H:%M"),
-        "todate":to_dt.strftime("%Y-%m-%d %H:%M")
+        "fromdate":from_dt.strftime(
+            "%Y-%m-%d %H:%M"
+        ),
+        "todate":to_dt.strftime(
+            "%Y-%m-%d %H:%M"
+        )
     }
 
     for attempt in range(MAX_RETRY+1):
@@ -394,8 +343,8 @@ def candle(api,token):
                     )
 
                     for c in [
-                        "open","high","low",
-                        "close","volume"
+                        "open","high",
+                        "low","close","volume"
                     ]:
                         df[c]=pd.to_numeric(
                             df[c],
@@ -411,7 +360,9 @@ def candle(api,token):
                     df=df.sort_values("date")
                     df=df.reset_index(drop=True)
 
-                    today=datetime.now(IST).date()
+                    today=datetime.now(
+                        IST
+                    ).date()
 
                     df=df[
                         df["date"].dt.date<today
@@ -432,7 +383,10 @@ def candle(api,token):
                 )
                 time.sleep(RATE_WAIT)
             else:
-                log("Candle error: "+txt[:250])
+                log(
+                    "Candle error: "+
+                    txt[:250]
+                )
                 time.sleep(5)
 
         except Exception as e:
@@ -449,7 +403,10 @@ def candle(api,token):
                 )
                 time.sleep(RATE_WAIT)
             else:
-                log("Candle exception: "+txt[:250])
+                log(
+                    "Candle exception: "+
+                    txt[:250]
+                )
                 time.sleep(5)
 
     return None
@@ -465,12 +422,10 @@ def analyze(sym,df,ltp):
         span=21,
         adjust=False
     ).mean()
-
     df["ema50"]=df["close"].ewm(
         span=50,
         adjust=False
     ).mean()
-
     df["ema200"]=df["close"].ewm(
         span=200,
         adjust=False
@@ -486,7 +441,9 @@ def analyze(sym,df,ltp):
     if avg20<MIN_AVG20:
         return None
 
-    volx=float(cur["volume"])/avg20 if avg20 else 0
+    volx=float(
+        cur["volume"]
+    )/avg20 if avg20 else 0
 
     if volx<MIN_VOLX:
         return None
@@ -514,7 +471,6 @@ def analyze(sym,df,ltp):
     )
 
     weekly_sma40=weekly.rolling(40).mean()
-
     weekly_up=False
 
     if len(weekly)>=40:
@@ -575,8 +531,10 @@ def analyze(sym,df,ltp):
     )
 
     month_score=(
-        15 if monthly_up and monthly_slope
-        else 10 if monthly_up
+        15
+        if monthly_up and monthly_slope
+        else 10
+        if monthly_up
         else 0
     )
 
@@ -654,10 +612,16 @@ def phase2(api,candidates):
             f"Scanning {sym}..."
         )
 
-        df=candle(api,c["token"])
+        df=candle(
+            api,
+            c["token"]
+        )
 
         if df is None:
-            log("  Skipped - candle unavailable")
+            log(
+                "  Skipped - "
+                "candle unavailable"
+            )
             continue
 
         try:
@@ -676,10 +640,15 @@ def phase2(api,candidates):
                     f"Vol {x['volx']:.2f}x"
                 )
             else:
-                log("  No qualifying setup")
+                log(
+                    "  No qualifying setup"
+                )
 
         except Exception as e:
-            log("  Analysis error: "+str(e))
+            log(
+                "  Analysis error: "+
+                str(e)
+            )
 
         time.sleep(STOCK_DELAY)
 
@@ -694,7 +663,9 @@ def phase2(api,candidates):
     return results
 
 def telegram(results):
-    now=datetime.now(IST).strftime(
+    now=datetime.now(
+        IST
+    ).strftime(
         "%d-%b-%Y %I:%M %p"
     )
 
@@ -707,8 +678,6 @@ def telegram(results):
         )
         return
 
-    top=results[:10]
-
     lines=[
         "🚀 ANGEL ONE SWING BUY",
         f"Time: {now} IST",
@@ -716,13 +685,18 @@ def telegram(results):
         ""
     ]
 
-    for i,x in enumerate(top,1):
+    for i,x in enumerate(
+        results[:10],
+        1
+    ):
         lines += [
             f"#{i} {x['symbol']} "
-            f"{x['stars']}  Score:{x['score']}",
+            f"{x['stars']} "
+            f"Score:{x['score']}",
             f"LTP: ₹{x['ltp']:.2f}",
             f"SL: ₹{x['sl']:.2f}",
-            f"TGT: ₹{x['t1']:.2f} / ₹{x['t2']:.2f}",
+            f"TGT: ₹{x['t1']:.2f} / "
+            f"₹{x['t2']:.2f}",
             f"Vol: {x['volx']:.2f}x | "
             f"52W: ₹{x['high52']:.2f}",
             f"Risk: {x['risk']:.1f}%",
@@ -732,20 +706,32 @@ def telegram(results):
         ]
 
     lines.append(
-        "⚠️ Signal only | No automatic orders"
+        "⚠️ Signal only | "
+        "No automatic orders"
     )
 
-    send_tg("\n".join(lines))
+    send_tg(
+        "\n".join(lines)
+    )
 
 def main():
     log("="*60)
-    log(" ANGEL ONE SWING SCANNER V3.6.4")
-    log(" RESUME MASTER + MTF + RATE LIMIT SAFE")
+    log(
+        " ANGEL ONE SWING SCANNER V3.6.5"
+    )
+    log(
+        " MASTER DOWNLOAD FIXED"
+    )
+    log(
+        " MTF + RATE LIMIT SAFE"
+    )
     log("="*60)
 
     log(
         "Time: "+
-        datetime.now(IST).strftime(
+        datetime.now(
+            IST
+        ).strftime(
             "%d-%m-%Y %H:%M:%S IST"
         )
     )
