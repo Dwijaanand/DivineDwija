@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install smartapi-python pyotp pandas requests logzero
+          pip install smartapi-python pyotp pandas requests logzero websocket-client pytz
 
       - name: Run python scanner.py
         env:
