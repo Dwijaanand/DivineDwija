@@ -1,277 +1,168 @@
-import os,json,time,random,requests
+import os, time, requests, pyotp, pandas as pd
 from datetime import datetime,timedelta
-import pandas as pd
-import pyotp
 from SmartApi import SmartConnect
 
-API_KEY=os.getenv("API_KEY") or os.getenv("SMARTAPI_API_KEY")
-CLIENT_ID=os.getenv("CLIENT_ID") or os.getenv("SMARTAPI_CLIENT_ID")
-PASSWORD=os.getenv("PASSWORD") or os.getenv("SMARTAPI_PASSWORD")
-TOTP_SECRET=os.getenv("TOTP_SECRET") or os.getenv("SMARTAPI_TOTP_SECRET")
-TELE_BOT=os.getenv("TELEGRAM_BOT_TOKEN")
-TELE_CHAT=os.getenv("TELEGRAM_CHAT_ID")
+# ============ GITHUB SECRETS SE LEGA ============
+API_KEY=os.getenv("API_KEY")
+CLIENT_ID=os.getenv("CLIENT_ID")
+PASSWORD=os.getenv("PASSWORD")
+TOTP_SECRET=os.getenv("TOTP_SECRET")
+TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
+# ================================================
 
-DELAY=1.5
-TOP_N=80
-REST_EVERY=15
-VOL_THRESHOLD=1.8
+MIN_PRICE=20.0
+MIN_SCORE=70
+MAX_SIGNALS=15
+DELAY=1.2
 
-def log(m):
-    print(m,flush=True)
+MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+HIGH_URL="https://www.nseindia.com/api/live-analysis-data-52weekhighstock"
+LOW_URL="https://www.nseindia.com/api/live-analysis-data-52weeklowstock"
 
-def send_telegram(msg):
-    if not TELE_BOT or not TELE_CHAT:
-        return
-    try:
-        url=f"https://api.telegram.org/bot{TELE_BOT}/sendMessage"
-        requests.post(url,json={"chat_id":TELE_CHAT,"text":msg,"parse_mode":"Markdown"},timeout=10)
-    except Exception as e:
-        log(f"Telegram fail: {e}")
+NSE=requests.Session()
+NSE.headers.update({"User-Agent":"Mozilla/5.0 Chrome/124.0.0.0","Referer":"https://www.nseindia.com/market-data/52-week-high-equity-market"})
 
-def get_obj():
-    if not API_KEY or not CLIENT_ID or not PASSWORD or not TOTP_SECRET:
-        raise Exception(f"Secrets missing! API={bool(API_KEY)} CLIENT={bool(CLIENT_ID)} PASSWORD={bool(PASSWORD)} TOTP={bool(TOTP_SECRET)}")
-    clean_secret=TOTP_SECRET.strip().replace(" ","")
-    obj=SmartConnect(api_key=API_KEY.strip())
-    for attempt in range(1,3):
-        try:
-            log(f"Generating TOTP... attempt {attempt}/2")
-            totp=pyotp.TOTP(clean_secret).now()
-            data=obj.generateSession(CLIENT_ID.strip(),PASSWORD.strip(),totp)
-            if data and data.get("status"):
-                log("Angel Login OK - V3.5.7")
-                return obj
-            log(f"Login response: {data}")
-        except Exception as e:
-            log(f"Login attempt {attempt} failed: {e}")
-            if attempt<2:
-                time.sleep(3)
-    raise Exception("Angel One login failed")
+def log(m): print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}",flush=True)
+
+def get_52w():
+    NSE.get("https://www.nseindia.com",timeout=15)
+    h=NSE.get(HIGH_URL,timeout=25).json(); time.sleep(1); l=NSE.get(LOW_URL,timeout=25).json()
+    def ext(o):
+        s=set()
+        def w(x):
+            if isinstance(x,dict):
+                for k,v in x.items():
+                    if str(k).lower() in ("symbol","symbols"):
+                        if isinstance(v,str): s.add(v.upper())
+                        elif isinstance(v,list):
+                            for i in v:
+                                if isinstance(i,str): s.add(i.upper())
+                                elif isinstance(i,dict) and "symbol" in i: s.add(str(i["symbol"]).upper())
+                for v in x.values(): w(v)
+            elif isinstance(x,list):
+                for i in x: w(i)
+        w(o); return {x for x in s if x.isalnum() and len(x)<20}
+    return ext(h), ext(l)
 
 def load_master():
-    local="OpenAPIScripMaster.json"
-    if os.path.exists(local):
-        try:
-            log("Trying local OpenAPIScripMaster.json...")
-            with open(local,"r") as f:
-                data=json.load(f)
-            if isinstance(data,list) and len(data)>1000:
-                log(f"Local master loaded: {len(data)} records")
-                return data
-        except Exception as e:
-            log(f"Local master error: {e}")
-    url="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    for i in range(3):
-        try:
-            log(f"Downloading master Attempt {i+1}/3...")
-            r=requests.get(url,timeout=60)
-            r.raise_for_status()
-            data=r.json()
-            if not isinstance(data,list) or len(data)<1000:
-                raise Exception("Master data incomplete")
-            with open(local,"w") as f:
-                json.dump(data,f)
-            log(f"Master downloaded: {len(data)} records")
-            return data
-        except Exception as e:
-            log(f"Attempt {i+1} failed: {e}")
-            time.sleep(5)
-    raise Exception("NSE master loading failed")
+    r=requests.get(MASTER_URL,timeout=60).json()
+    return {str(x.get("symbol")).replace("-EQ",""):str(x.get("token")) for x in r if str(x.get("exch_seg"))=="NSE" and str(x.get("symbol","")).endswith("-EQ")}
 
-def get_candle(obj,token,interval="ONE_DAY",days=500):
-    to_date=datetime.now()
-    from_date=to_date-timedelta(days=days)
-    params={"exchange":"NSE","symboltoken":str(token),"interval":interval,"fromdate":from_date.strftime("%Y-%m-%d %H:%M"),"todate":to_date.strftime("%Y-%m-%d %H:%M")}
-    for attempt in range(5):
-        try:
-            res=obj.getCandleData(params)
-            if res and res.get("status") and res.get("data"):
-                df=pd.DataFrame(res["data"], columns=["time","open","high","low","close","volume"])
-                df["time"]=pd.to_datetime(df["time"])
-                for c in ["open","high","low","close","volume"]:
-                    df[c]=pd.to_numeric(df[c],errors="coerce")
-                df=df.dropna().sort_values("time").reset_index(drop=True)
-                return df
-            msg=str(res).lower()
-            if "rate" in msg or "access" in msg or "exceed" in msg or "too many" in msg:
-                wait=8*(attempt+1)+random.randint(1,4)
-                log(f" Rate limit. Waiting {wait}s ({attempt+1}/5)")
-                time.sleep(wait)
-                continue
-            return None
-        except Exception as e:
-            em=str(e).lower()
-            if "rate" in em or "access" in em or "exceed" in em:
-                wait=8*(attempt+1)+random.randint(1,4)
-                log(f" Rate limit. Waiting {wait}s ({attempt+1}/5)")
-                time.sleep(wait)
-            else:
-                log(f" Candle error: {e}")
-                time.sleep(1)
-                return None
-    return None
+def login():
+    if not API_KEY or not CLIENT_ID or not PASSWORD or not TOTP_SECRET:
+        raise Exception(f"Secrets missing! API={bool(API_KEY)} CLIENT={bool(CLIENT_ID)}")
+    obj=SmartConnect(api_key=API_KEY.strip())
+    res=obj.generateSession(CLIENT_ID.strip(),PASSWORD.strip(),pyotp.TOTP(TOTP_SECRET.strip().replace(" ","")).now())
+    if res.get("status"): log("Login OK"); return obj
+    raise Exception(f"Login Fail {res}")
 
-def calc_rsi(series,period=14):
-    delta=series.diff()
-    gain=delta.where(delta>0,0).rolling(period).mean()
-    loss=(-delta.where(delta<0,0)).rolling(period).mean()
-    rs=gain/loss
-    return 100-(100/(1+rs))
+def daily(obj,token):
+    now=datetime.now(); frm=now-timedelta(days=750)
+    q={"exchange":"NSE","symboltoken":token,"interval":"ONE_DAY","fromdate":frm.strftime("%Y-%m-%d 09:15"),"todate":now.strftime("%Y-%m-%d 15:30")}
+    res=obj.getCandleData(q)
+    if not res or not res.get("data"): return None
+    df=pd.DataFrame(res["data"],columns=["time","open","high","low","close","volume"])
+    df["time"]=pd.to_datetime(df["time"])
+    for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+    df=df.dropna().sort_values("time").set_index("time")
+    df=df[df.index.date < datetime.now().date()]
+    return df if len(df)>=250 else None
 
-def make_monthly(df):
-    x=df.copy().set_index("time")
-    return x.resample("ME").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
-def make_weekly(df):
-    x=df.copy().set_index("time")
-    return x.resample("W-FRI").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
+def ema(s,n): return s.ewm(span=n,adjust=False).mean()
+def rsi(s,p=14):
+    d=s.diff(); g=d.clip(lower=0); l=-d.clip(upper=0)
+    return 100-(100/(1+g.ewm(alpha=1/p,adjust=False).mean()/l.ewm(alpha=1/p,adjust=False).mean()))
+def add_ind(df):
+    df["ema21"]=ema(df["close"],21); df["ema50"]=ema(df["close"],50); df["ema200"]=ema(df["close"],200)
+    df["rsi"]=rsi(df["close"]); df["vol20"]=df["volume"].rolling(20).mean()
+    df["hh20"]=df["high"].shift(1).rolling(20).max(); df["ll20"]=df["low"].shift(1).rolling(20).min()
+    tr=pd.concat([df["high"]-df["low"],(df["high"]-df["close"].shift()).abs(),(df["low"]-df["close"].shift()).abs()],axis=1).max(axis=1)
+    df["atr"]=tr.rolling(14).mean(); return df
+def tf(df,rule):
+    x=df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+    return add_ind(x)
 
-def get_completed_week_rows(w,scan_date):
-    w=w.copy()
-    w["period_end"]=pd.to_datetime(w["time"]).dt.normalize()
-    scan_day=pd.Timestamp(scan_date).normalize()
-    completed=w[w["period_end"]<scan_day].copy()
-    if len(completed)>=2:
-        return completed.iloc[-1],completed.iloc[-2]
-    return None,None
+def analyze(df,sym,side):
+    d=add_ind(df.copy()); w=tf(df,"W-FRI"); m=tf(df,"ME")
+    if len(w)<50 or len(m)<20: return None
+    dc=d.iloc[-1]; d1=d.iloc[-2]; wc=w.iloc[-1]; wc1=w.iloc[-2]; mc=m.iloc[-1]; mc1=m.iloc[-2]
+    close=float(dc["close"]); atr=float(dc["atr"]); volx=float(dc["volume"]/dc["vol20"]) if dc["vol20"]>0 else 0
+    if close<MIN_PRICE or atr<=0: return None
+    score=0; why=[]; setup=None
+    if side=="BUY":
+        monthly_up=mc["close"]>mc["ema21"] and mc["close"]>mc1["close"]
+        weekly_up=wc["close"]>wc["ema21"] and wc["close"]>wc["ema50"]
+        if close>dc["hh20"]: setup="20D Breakout (52W High)"; score+=30; why.append("Daily 20D High Break")
+        elif close>d1["high"] and close>dc["ema21"]: setup="Base Breakout"; score+=25; why.append(f"Prev High {d1['high']:.1f} Break")
+        else: return None
+        if monthly_up: score+=20; why.append(f"Monthly UP {mc1['close']:.0f}->{mc['close']:.0f}")
+        if weekly_up: score+=20; why.append(f"Weekly UP {wc1['close']:.0f}->{wc['close']:.0f}")
+        if close>dc["ema200"]: score+=10; why.append("200EMA Upar")
+        if volx>=1.5: score+=15; why.append(f"Vol {volx:.1f}x")
+        if 50<=dc["rsi"]<=75: score+=10; why.append(f"RSI {dc['rsi']:.0f}")
+        if score<MIN_SCORE: return None
+        sl=max(float(d["low"].tail(10).min()), close-1.5*atr, float(dc["ema21"])*0.985)
+        risk=close-sl
+        if risk<=0 or not 2<=risk/close*100<=8: return None
+        return {"side":"BUY","symbol":sym,"setup":setup,"score":score,"price":close,"sl":sl,"t1":close+1.8*risk,"t2":close+3*risk,"risk":risk/close*100,"rsi":float(dc["rsi"]),"vol":volx,"why":why,"logic":"Monthly UP + Weekly UP + Daily Breakout | SL=SwingLow/ATR/EMA21"}
+    else:
+        monthly_down=mc["close"]<mc["ema21"] and mc["close"]<mc1["close"]
+        weekly_down=wc["close"]<wc["ema21"] and wc["close"]<wc["ema50"]
+        if close<dc["ll20"]: setup="20D Breakdown (52W Low)"; score+=30; why.append("Daily 20D Low Break")
+        elif close<d1["low"] and close<dc["ema21"]: setup="Base Breakdown"; score+=25; why.append(f"Prev Low {d1['low']:.1f} Break")
+        else: return None
+        if monthly_down: score+=20; why.append(f"Monthly DOWN {mc1['close']:.0f}->{mc['close']:.0f}")
+        if weekly_down: score+=20; why.append(f"Weekly DOWN {wc1['close']:.0f}->{wc['close']:.0f}")
+        if close<dc["ema200"]: score+=10; why.append("200EMA Neeche")
+        if volx>=1.2: score+=10; why.append(f"Vol {volx:.1f}x")
+        if score<MIN_SCORE: return None
+        cands=[x for x in [float(d["high"].tail(10).max()), close+1.5*atr, float(dc["ema21"])*1.015] if x>close]
+        if not cands: return None
+        sl=min(cands); risk=sl-close
+        if risk<=0 or not 2<=risk/close*100<=8: return None
+        return {"side":"SELL","symbol":sym,"setup":setup,"score":score,"price":close,"sl":sl,"t1":close-1.8*risk,"t2":close-3*risk,"risk":risk/close*100,"rsi":float(dc["rsi"]),"vol":volx,"why":why,"logic":"Monthly DOWN + Weekly DOWN + Daily Breakdown"}
 
-def get_completed_month_rows(m,scan_date):
-    m=m.copy()
-    m["period_end"]=pd.to_datetime(m["time"]).dt.normalize()
-    scan_day=pd.Timestamp(scan_date).normalize()
-    completed=m[m["period_end"]<scan_day].copy()
-    if len(completed)>=2:
-        return completed.iloc[-1],completed.iloc[-2]
-    return None,None
+def tg(txt):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    try:
+        for i in range(0, len(txt), 3800):
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",json={"chat_id":TELEGRAM_CHAT_ID,"text":txt[i:i+3800],"parse_mode":"Markdown"},timeout=15)
+            time.sleep(0.5)
+    except Exception as e: log(f"TG {e}")
 
-def get_star_score(volx,rsi,close,high_52,week_latest,week_previous,month_latest,month_previous,risk_pct):
-    score=0
-    if volx>=4: score+=25
-    elif volx>=3: score+=22
-    elif volx>=2.5: score+=19
-    elif volx>=2: score+=16
-    else: score+=13
-    if 60<=rsi<=75: score+=20
-    elif 55<=rsi<60 or 75<rsi<=80: score+=16
-    elif 80<rsi<=85: score+=12
-    else: score+=8
-    near_high=(close/high_52)*100 if high_52>0 else 0
-    if near_high>=97: score+=20
-    elif near_high>=94: score+=18
-    elif near_high>=90: score+=16
-    elif near_high>=87: score+=14
-    else: score+=11
-    week_change=((week_latest/week_previous)-1)*100 if week_previous>0 else 0
-    if week_change>=5: score+=15
-    elif week_change>=3: score+=13
-    elif week_change>=1.5: score+=11
-    else: score+=9
-    month_change=((month_latest/month_previous)-1)*100 if month_previous>0 else 0
-    if month_change>=8: score+=15
-    elif month_change>=5: score+=13
-    elif month_change>=2: score+=11
-    else: score+=9
-    if risk_pct<=4: score+=5
-    elif risk_pct<=6: score+=4
-    elif risk_pct<=8: score+=3
-    else: score+=1
-    return score
-
-def get_stars(score):
-    if score>=90: return "⭐⭐⭐⭐⭐"
-    elif score>=82: return "⭐⭐⭐⭐"
-    elif score>=74: return "⭐⭐⭐"
-    elif score>=66: return "⭐⭐"
-    return "⭐"
+def fmt(s):
+    icon="🟢" if s["side"]=="BUY" else "🔴"
+    title="BUY" if s["side"]=="BUY" else "SELL/SHORT"
+    why_txt="\n- ".join(s["why"])
+    return f"""{icon} *{title} {s['symbol']}* | Score {s['score']}\n*Setup:* {s['setup']}\n*Entry:* ₹{s['price']:.2f}\n*SL:* ₹{s['sl']:.2f} ({s['risk']:.1f}% Risk)\n*TGT1:* ₹{s['t1']:.2f} | *TGT2:* ₹{s['t2']:.2f}\nRSI {s['rsi']:.0f} | Vol {s['vol']:.1f}x\n*Chart Read:*\n- {why_txt}\n*Buy Logic:* {s['logic']}\n"""
 
 def main():
-    log("="*70)
-    log(" ANGEL ONE NSE BUY SCANNER V3.5.7")
-    log("="*70)
-    log(f"Time: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')} IST")
-    obj=get_obj()
-    master=load_master()
-    nse_stocks=[s for s in master if s.get("exch_seg")=="NSE" and str(s.get("symbol","")).endswith("-EQ")]
-    log(f"NSE stocks: {len(nse_stocks)}")
-    log("PHASE 1: VOLUME SCAN...")
-    candidates=[]
-    for idx,s in enumerate(nse_stocks):
-        if idx%200==0: log(f"Scanning {idx}/{len(nse_stocks)}")
-        df=get_candle(obj,s["token"],"ONE_DAY",60)
-        time.sleep(DELAY)
-        if df is None or len(df)<30: continue
-        try:
-            avg_vol=df["volume"].iloc[-30:-1].mean()
-            curr_vol=df["volume"].iloc[-1]
-            if avg_vol>0:
-                volx=curr_vol/avg_vol
-                if volx>=VOL_THRESHOLD:
-                    candidates.append((s,volx,df))
-        except Exception: continue
-        if len(candidates)>=200: break
-    candidates=sorted(candidates, key=lambda x:x[1], reverse=True)[:TOP_N]
-    log(f"PHASE 1 DONE: {len(candidates)} candidates")
-    if not candidates:
-        send_telegram(f"No picks today - V3.5.7\nNSE: {len(nse_stocks)}\nVolume candidates: 0")
-        return
-    time.sleep(20)
-    log("PHASE 2: DAILY + WEEKLY + MONTHLY")
-    picks=[]
-    scan_date=datetime.now()
-    for count,(stock,volx,df_daily) in enumerate(candidates,1):
-        sym=stock.get("name") or stock.get("symbol","UNKNOWN")
-        log(f"[{count}/{len(candidates)}] {sym}")
-        if count%REST_EVERY==0:
-            log("Resting 10s..."); time.sleep(10)
-        df=df_daily
-        if df is None or len(df)<200:
-            df=get_candle(obj,stock["token"],"ONE_DAY",500)
-            time.sleep(DELAY)
-        if df is None or len(df)<200: continue
-        try:
-            df=df.sort_values("time").reset_index(drop=True)
-            df["rsi"]=calc_rsi(df["close"])
-            close=float(df["close"].iloc[-1]); rsi=float(df["rsi"].iloc[-1])
-            high_52=float(df["high"].tail(250).max())
-            w=make_weekly(df); m=make_monthly(df)
-            if len(w)<3 or len(m)<3: continue
-            latest_week,previous_week=get_completed_week_rows(w,scan_date)
-            if latest_week is None or previous_week is None: continue
-            latest_month,previous_month=get_completed_month_rows(m,scan_date)
-            if latest_month is None or previous_month is None: continue
-            daily_avg=df["close"].rolling(44).mean().iloc[-1]
-            cond1=(close>daily_avg); cond2=(55<rsi<90); cond3=(close>=high_52*0.85)
-            week_latest_close=float(latest_week["close"]); week_previous_close=float(previous_week["close"])
-            cond4=(week_latest_close>week_previous_close)
-            month_latest_close=float(latest_month["close"]); month_previous_close=float(previous_month["close"])
-            cond5=(month_latest_close>month_previous_close)
-            if cond1 and cond2 and cond3 and cond4 and cond5:
-                sl=float(df["low"].tail(10).min()); risk=close-sl
-                if risk<=0: continue
-                tgt1=close+(risk*1.5); tgt2=close+(risk*2.2)
-                risk_pct=(risk/close)*100
-                strength=get_star_score(volx,rsi,close,high_52,week_latest_close,week_previous_close,month_latest_close,month_previous_close,risk_pct)
-                stars=get_stars(strength)
-                picks.append({"sym":sym,"close":close,"high_52":high_52,"volx":volx,"rsi":rsi,"week_latest":week_latest_close,"week_previous":week_previous_close,"month_latest":month_latest_close,"month_previous":month_previous_close,"sl":sl,"tgt1":tgt1,"tgt2":tgt2,"risk_pct":risk_pct,"strength":strength,"stars":stars})
-                log(f" BUY ✅ | Strength {strength}/100 | {stars}")
-            else:
-                log(" No qualifying setup")
-        except Exception as e:
-            log(f" Calculation error: {e}")
-        time.sleep(DELAY)
-    picks=sorted(picks, key=lambda x:x["strength"], reverse=True)
-    log(f"DONE - V3.5.7 COMPLETE - Picks: {len(picks)}")
-    if picks:
-        ranked_text=[]
-        for i,p in enumerate(picks[:5],1):
-            text=(f"*#{i} {p['sym']} {p['stars']}*\nStrength: {p['strength']}/100\nLTP: ₹{p['close']:.1f} | 52W: ₹{p['high_52']:.1f}\nVol: {p['volx']:.1f}x | RSI: {p['rsi']:.0f}\nW: {p['week_latest']:.0f}>{p['week_previous']:.0f} M: {p['month_latest']:.0f}>{p['month_previous']:.0f}\nRisk: {p['risk_pct']:.1f}%\nSL: ₹{p['sl']:.0f} | TGT: ₹{p['tgt1']:.0f} / ₹{p['tgt2']:.0f}\n")
-            ranked_text.append(text)
-        msg=(f"🚀 *PURA NSE BUY - {datetime.now().strftime('%d %b')} - V3.5.7* 🚀\n\nTotal NSE: {len(nse_stocks)}\nTop Candidates: {len(candidates)}\nBUY: {len(picks)}\n\n🏆 *TOP 5 SETUP RANKING*\n\n"+ "\n".join(ranked_text))
-        send_telegram(msg)
+    log("=== NSE 52W V3.1 ENTRY SL TGT ===")
+    high,low=get_52w(); master=load_master(); obj=login()
+    ht={s:master[s] for s in high if s in master}
+    lt={s:master[s] for s in low if s in master}
+    log(f"BUY:{len(ht)} SELL:{len(lt)} | Filter ₹{MIN_PRICE}+")
+    sigs=[]
+    for i,(sym,tok) in enumerate(ht.items(),1):
+        log(f"[BUY {i}/{len(ht)}] {sym}"); df=daily(obj,tok); time.sleep(DELAY)
+        if df is None: continue
+        r=analyze(df,sym,"BUY")
+        if r: sigs.append(r); log(f"FOUND BUY {r['symbol']} {r['score']}")
+    for i,(sym,tok) in enumerate(lt.items(),1):
+        log(f"[SELL {i}/{len(lt)}] {sym}"); df=daily(obj,tok); time.sleep(DELAY)
+        if df is None: continue
+        r=analyze(df,sym,"SELL")
+        if r: sigs.append(r); log(f"FOUND SELL {r['symbol']} {r['score']}")
+    sigs=sorted(sigs,key=lambda x:x["score"],reverse=True)[:MAX_SIGNALS]
+    buys=[x for x in sigs if x["side"]=="BUY"]; sells=[x for x in sigs if x["side"]=="SELL"]
+    log(f"DONE BUY:{len(buys)} SELL:{len(sells)}")
+    if sigs:
+        head=f"🚀 *NSE 52W {datetime.now().strftime('%d %b %Y')}* | High:{len(high)} Low:{len(low)} | BUY:{len(buys)} SELL:{len(sells)}\nPrice Filter: ₹{MIN_PRICE}+\n\n"
+        body="\n".join(fmt(x) for x in sigs)
+        full=head+body
+        print(full); tg(full)
     else:
-        send_telegram(f"No picks today - V3.5.7\nNSE: {len(nse_stocks)}\nCandidates: {len(candidates)}\n\nDaily + Weekly + Monthly filters: No BUY")
+        txt=f"No Setup Today High:{len(high)} Low:{len(low)}"; print(txt); tg(txt)
 
-if __name__=="__main__":
-    try: main()
-    except Exception as e:
-        log(f"❌ FATAL ERROR: {e}")
-        send_telegram(f"❌ ANGEL ONE SCANNER V3.5.7 ERROR\n\n{e}")
+if __name__=="__main__": main()
