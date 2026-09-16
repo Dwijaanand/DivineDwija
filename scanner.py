@@ -5,7 +5,7 @@ import pyotp
 from SmartApi import SmartConnect
 
 # ========== ANGEL ONE NSE BUY SCANNER V3.5.7 ==========
-# SAME CORE STRATEGY
+# SAME CORE STRATEGY + STAR RANKING
 # DAILY = SWING SETUP
 # WEEKLY = SWING TREND CONFIRMATION
 # MONTHLY = QUALITY FILTER
@@ -32,11 +32,7 @@ def send_telegram(msg):
         return
     try:
         url=f"https://api.telegram.org/bot{TELE_BOT}/sendMessage"
-        requests.post(
-            url,
-            json={"chat_id":TELE_CHAT,"text":msg,"parse_mode":"Markdown"},
-            timeout=10
-        )
+        requests.post(url,json={"chat_id":TELE_CHAT,"text":msg,"parse_mode":"Markdown"},timeout=10)
     except Exception as e:
         log(f"Telegram fail: {e}")
 
@@ -56,11 +52,7 @@ def get_obj():
         try:
             log(f"Generating TOTP... attempt {attempt}/2")
             totp=pyotp.TOTP(clean_secret).now()
-            data=obj.generateSession(
-                CLIENT_ID.strip(),
-                PASSWORD.strip(),
-                totp
-            )
+            data=obj.generateSession(CLIENT_ID.strip(),PASSWORD.strip(),totp)
 
             if data and data.get("status"):
                 log("Angel Login OK - V3.5.7")
@@ -136,10 +128,7 @@ def get_candle(obj,token,interval="ONE_DAY",days=500):
             if res and res.get("status") and res.get("data"):
                 df=pd.DataFrame(
                     res["data"],
-                    columns=[
-                        "time","open","high",
-                        "low","close","volume"
-                    ]
+                    columns=["time","open","high","low","close","volume"]
                 )
 
                 df["time"]=pd.to_datetime(df["time"])
@@ -155,17 +144,9 @@ def get_candle(obj,token,interval="ONE_DAY",days=500):
 
             msg=str(res).lower()
 
-            if (
-                "rate" in msg
-                or "access" in msg
-                or "exceed" in msg
-                or "too many" in msg
-            ):
+            if "rate" in msg or "access" in msg or "exceed" in msg or "too many" in msg:
                 wait=8*(attempt+1)+random.randint(1,4)
-                log(
-                    f" Rate limit. Waiting {wait}s "
-                    f"({attempt+1}/5)"
-                )
+                log(f" Rate limit. Waiting {wait}s ({attempt+1}/5)")
                 time.sleep(wait)
                 continue
 
@@ -174,16 +155,9 @@ def get_candle(obj,token,interval="ONE_DAY",days=500):
         except Exception as e:
             em=str(e).lower()
 
-            if (
-                "rate" in em
-                or "access" in em
-                or "exceed" in em
-            ):
+            if "rate" in em or "access" in em or "exceed" in em:
                 wait=8*(attempt+1)+random.randint(1,4)
-                log(
-                    f" Rate limit. Waiting {wait}s "
-                    f"({attempt+1}/5)"
-                )
+                log(f" Rate limit. Waiting {wait}s ({attempt+1}/5)")
                 time.sleep(wait)
             else:
                 log(f" Candle error: {e}")
@@ -202,46 +176,25 @@ def calc_rsi(series,period=14):
 def make_monthly(df):
     x=df.copy()
     x=x.set_index("time")
-
     m=x.resample("ME").agg({
-        "open":"first",
-        "high":"max",
-        "low":"min",
-        "close":"last",
-        "volume":"sum"
+        "open":"first","high":"max","low":"min",
+        "close":"last","volume":"sum"
     }).dropna().reset_index()
-
     return m
 
 def make_weekly(df):
     x=df.copy()
     x=x.set_index("time")
-
     w=x.resample("W-FRI").agg({
-        "open":"first",
-        "high":"max",
-        "low":"min",
-        "close":"last",
-        "volume":"sum"
+        "open":"first","high":"max","low":"min",
+        "close":"last","volume":"sum"
     }).dropna().reset_index()
-
     return w
 
 def get_completed_week_rows(w,scan_date):
-    """
-    Returns:
-    latest completed week
-    previous completed week
-
-    If current week is still running, it is ignored.
-    If current week has already ended, it is allowed.
-    """
-
     w=w.copy()
     w["period_end"]=pd.to_datetime(w["time"]).dt.normalize()
-
     scan_day=pd.Timestamp(scan_date).normalize()
-
     completed=w[w["period_end"]<scan_day].copy()
 
     if len(completed)>=2:
@@ -250,19 +203,9 @@ def get_completed_week_rows(w,scan_date):
     return None,None
 
 def get_completed_month_rows(m,scan_date):
-    """
-    Returns:
-    latest completed month
-    previous completed month
-
-    Current incomplete month is ignored.
-    """
-
     m=m.copy()
     m["period_end"]=pd.to_datetime(m["time"]).dt.normalize()
-
     scan_day=pd.Timestamp(scan_date).normalize()
-
     completed=m[m["period_end"]<scan_day].copy()
 
     if len(completed)>=2:
@@ -270,18 +213,107 @@ def get_completed_month_rows(m,scan_date):
 
     return None,None
 
+# =========================================================
+# STAR RANKING
+# QUALIFICATION CONDITIONS ARE NOT CHANGED.
+# THIS ONLY RANKS STOCKS THAT ALREADY PASSED.
+# =========================================================
+
+def get_star_score(volx,rsi,close,high_52,week_latest,week_previous,
+                   month_latest,month_previous,risk_pct):
+    score=0
+
+    # Volume strength: 0-25
+    if volx>=4:
+        score+=25
+    elif volx>=3:
+        score+=22
+    elif volx>=2.5:
+        score+=19
+    elif volx>=2:
+        score+=16
+    else:
+        score+=13
+
+    # RSI strength: 0-20
+    if 60<=rsi<=75:
+        score+=20
+    elif 55<=rsi<60 or 75<rsi<=80:
+        score+=16
+    elif 80<rsi<=85:
+        score+=12
+    else:
+        score+=8
+
+    # 52W position: 0-20
+    near_high=(close/high_52)*100 if high_52>0 else 0
+
+    if near_high>=97:
+        score+=20
+    elif near_high>=94:
+        score+=18
+    elif near_high>=90:
+        score+=16
+    elif near_high>=87:
+        score+=14
+    else:
+        score+=11
+
+    # Weekly strength: 0-15
+    week_change=((week_latest/week_previous)-1)*100 if week_previous>0 else 0
+
+    if week_change>=5:
+        score+=15
+    elif week_change>=3:
+        score+=13
+    elif week_change>=1.5:
+        score+=11
+    else:
+        score+=9
+
+    # Monthly strength: 0-15
+    month_change=((month_latest/month_previous)-1)*100 if month_previous>0 else 0
+
+    if month_change>=8:
+        score+=15
+    elif month_change>=5:
+        score+=13
+    elif month_change>=2:
+        score+=11
+    else:
+        score+=9
+
+    # Risk quality: 0-5
+    if risk_pct<=4:
+        score+=5
+    elif risk_pct<=6:
+        score+=4
+    elif risk_pct<=8:
+        score+=3
+    else:
+        score+=1
+
+    return score
+
+def get_stars(score):
+    if score>=90:
+        return "⭐⭐⭐⭐⭐"
+    elif score>=82:
+        return "⭐⭐⭐⭐"
+    elif score>=74:
+        return "⭐⭐⭐"
+    elif score>=66:
+        return "⭐⭐"
+    return "⭐"
+
 def main():
 
     log("="*70)
     log(" ANGEL ONE NSE BUY SCANNER V3.5.7")
-    log(" SAME STRATEGY + COMPLETED CANDLE FIX")
+    log(" SAME STRATEGY + STAR RANKING")
     log("="*70)
 
-    log(
-        f"Time: "
-        f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')} IST"
-    )
-
+    log(f"Time: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')} IST")
     log("Mode: SWING")
     log("Daily: Swing Setup")
     log("Weekly: Trend Confirmation")
@@ -313,17 +345,9 @@ def main():
     for idx,s in enumerate(nse_stocks):
 
         if idx%200==0:
-            log(
-                f"Scanning "
-                f"{idx}/{len(nse_stocks)}"
-            )
+            log(f"Scanning {idx}/{len(nse_stocks)}")
 
-        df=get_candle(
-            obj,
-            s["token"],
-            "ONE_DAY",
-            60
-        )
+        df=get_candle(obj,s["token"],"ONE_DAY",60)
 
         time.sleep(DELAY)
 
@@ -335,13 +359,10 @@ def main():
             curr_vol=df["volume"].iloc[-1]
 
             if avg_vol>0:
-
                 volx=curr_vol/avg_vol
 
                 if volx>=VOL_THRESHOLD:
-                    candidates.append(
-                        (s,volx,df)
-                    )
+                    candidates.append((s,volx,df))
 
         except Exception:
             continue
@@ -356,14 +377,10 @@ def main():
     )[:TOP_N]
 
     log("")
-    log(
-        f"PHASE 1 DONE: "
-        f"{len(candidates)} candidates"
-    )
+    log(f"PHASE 1 DONE: {len(candidates)} candidates")
     log("")
 
     if not candidates:
-
         log("No volume candidates found.")
 
         send_telegram(
@@ -371,7 +388,6 @@ def main():
             f"NSE: {len(nse_stocks)}\n"
             f"Volume candidates: 0"
         )
-
         return
 
     time.sleep(20)
@@ -380,46 +396,26 @@ def main():
     # PHASE 2
     # =========================================================
 
-    log(
-        "PHASE 2: DAILY + WEEKLY + MONTHLY"
-    )
+    log("PHASE 2: DAILY + WEEKLY + MONTHLY")
     log("")
 
     picks=[]
-
     scan_date=datetime.now()
 
-    for count,(stock,volx,df_daily) in enumerate(
-        candidates,1
-    ):
+    for count,(stock,volx,df_daily) in enumerate(candidates,1):
 
-        sym=(
-            stock.get("name")
-            or stock.get("symbol","UNKNOWN")
-        )
+        sym=stock.get("name") or stock.get("symbol","UNKNOWN")
 
-        log(
-            f"[{count}/{len(candidates)}] "
-            f"{sym}"
-        )
+        log(f"[{count}/{len(candidates)}] {sym}")
 
         if count%REST_EVERY==0:
             log("Resting 10s...")
             time.sleep(10)
 
-        # =====================================================
-        # V3.5.6 FIX RETAINED
-        # Phase 1 = 60 days
-        # Phase 2 = needs 200+ days
-        # =====================================================
-
         df=df_daily
 
         if df is None or len(df)<200:
-
-            log(
-                " Fetching 500-day daily data..."
-            )
+            log(" Fetching 500-day daily data...")
 
             df=get_candle(
                 obj,
@@ -431,38 +427,23 @@ def main():
             time.sleep(DELAY)
 
         if df is None or len(df)<200:
-
-            log(
-                " Not enough daily data - skip"
-            )
-
+            log(" Not enough daily data - skip")
             continue
 
         try:
 
-            df=df.sort_values(
-                "time"
-            ).reset_index(drop=True)
+            df=df.sort_values("time").reset_index(drop=True)
 
             # =================================================
             # DAILY
             # =================================================
 
-            df["rsi"]=calc_rsi(
-                df["close"]
-            )
+            df["rsi"]=calc_rsi(df["close"])
 
-            close=float(
-                df["close"].iloc[-1]
-            )
+            close=float(df["close"].iloc[-1])
+            rsi=float(df["rsi"].iloc[-1])
 
-            rsi=float(
-                df["rsi"].iloc[-1]
-            )
-
-            high_52=float(
-                df["high"].tail(250).max()
-            )
+            high_52=float(df["high"].tail(250).max())
 
             # =================================================
             # WEEKLY / MONTHLY
@@ -472,65 +453,29 @@ def main():
             m=make_monthly(df)
 
             if len(w)<3 or len(m)<3:
-
-                log(
-                    " Weekly/Monthly data "
-                    "insufficient - skip"
-                )
-
+                log(" Weekly/Monthly data insufficient - skip")
                 continue
-
-            # =================================================
-            # COMPLETED WEEK SELECTION
-            # =================================================
 
             latest_week,previous_week=(
-                get_completed_week_rows(
-                    w,
-                    scan_date
-                )
+                get_completed_week_rows(w,scan_date)
             )
 
-            if (
-                latest_week is None
-                or previous_week is None
-            ):
-
-                log(
-                    " Completed weekly data "
-                    "insufficient - skip"
-                )
-
+            if latest_week is None or previous_week is None:
+                log(" Completed weekly data insufficient - skip")
                 continue
-
-            # =================================================
-            # COMPLETED MONTH SELECTION
-            # =================================================
 
             latest_month,previous_month=(
-                get_completed_month_rows(
-                    m,
-                    scan_date
-                )
+                get_completed_month_rows(m,scan_date)
             )
 
-            if (
-                latest_month is None
-                or previous_month is None
-            ):
-
-                log(
-                    " Completed monthly data "
-                    "insufficient - skip"
-                )
-
+            if latest_month is None or previous_month is None:
+                log(" Completed monthly data insufficient - skip")
                 continue
 
             # =================================================
-            # SAME CORE CONDITIONS
+            # SAME CORE CONDITIONS - UNCHANGED
             # =================================================
 
-            # DAILY TREND
             daily_avg=(
                 df["close"]
                 .rolling(44)
@@ -538,125 +483,95 @@ def main():
                 .iloc[-1]
             )
 
-            cond1=(
-                close>daily_avg
-            )
+            cond1=(close>daily_avg)
 
-            # RSI
-            cond2=(
-                55<rsi<90
-            )
+            cond2=(55<rsi<90)
 
-            # 52W NEAR HIGH
-            cond3=(
-                close>=high_52*0.85
-            )
+            cond3=(close>=high_52*0.85)
 
-            # WEEKLY TREND
-            week_latest_close=float(
-                latest_week["close"]
-            )
+            week_latest_close=float(latest_week["close"])
+            week_previous_close=float(previous_week["close"])
 
-            week_previous_close=float(
-                previous_week["close"]
-            )
+            cond4=(week_latest_close>week_previous_close)
 
-            cond4=(
-                week_latest_close
-                >
-                week_previous_close
-            )
+            month_latest_close=float(latest_month["close"])
+            month_previous_close=float(previous_month["close"])
 
-            # MONTHLY QUALITY
-            month_latest_close=float(
-                latest_month["close"]
-            )
-
-            month_previous_close=float(
-                previous_month["close"]
-            )
-
-            cond5=(
-                month_latest_close
-                >
-                month_previous_close
-            )
+            cond5=(month_latest_close>month_previous_close)
 
             # =================================================
-            # FINAL BUY
+            # FINAL BUY - SAME CONDITIONS
             # =================================================
 
-            if (
-                cond1
-                and cond2
-                and cond3
-                and cond4
-                and cond5
-            ):
+            if cond1 and cond2 and cond3 and cond4 and cond5:
 
-                sl=float(
-                    df["low"].tail(10).min()
-                )
-
+                sl=float(df["low"].tail(10).min())
                 risk=close-sl
 
                 if risk<=0:
-
-                    log(
-                        " Invalid SL - skip"
-                    )
-
+                    log(" Invalid SL - skip")
                     continue
 
-                tgt1=(
-                    close+
-                    (risk*1.5)
+                tgt1=close+(risk*1.5)
+                tgt2=close+(risk*2.2)
+
+                risk_pct=(risk/close)*100
+
+                # RANKING ONLY - DOES NOT DECIDE BUY
+                strength=get_star_score(
+                    volx,
+                    rsi,
+                    close,
+                    high_52,
+                    week_latest_close,
+                    week_previous_close,
+                    month_latest_close,
+                    month_previous_close,
+                    risk_pct
                 )
 
-                tgt2=(
-                    close+
-                    (risk*2.2)
-                )
+                stars=get_stars(strength)
 
-                text=(
-                    f"*{sym}*\n"
-                    f"LTP: ₹{close:.1f} | "
-                    f"52W: ₹{high_52:.1f}\n"
-                    f"Vol: {volx:.1f}x | "
-                    f"RSI: {rsi:.0f}\n"
-                    f"W: "
-                    f"{week_latest_close:.0f}>"
-                    f"{week_previous_close:.0f} "
-                    f"M: "
-                    f"{month_latest_close:.0f}>"
-                    f"{month_previous_close:.0f}\n"
-                    f"SL: ₹{sl:.0f} | "
-                    f"TGT: ₹{tgt1:.0f} / "
-                    f"₹{tgt2:.0f}\n"
-                )
-
-                picks.append(text)
+                picks.append({
+                    "sym":sym,
+                    "close":close,
+                    "high_52":high_52,
+                    "volx":volx,
+                    "rsi":rsi,
+                    "week_latest":week_latest_close,
+                    "week_previous":week_previous_close,
+                    "month_latest":month_latest_close,
+                    "month_previous":month_previous_close,
+                    "sl":sl,
+                    "tgt1":tgt1,
+                    "tgt2":tgt2,
+                    "risk_pct":risk_pct,
+                    "strength":strength,
+                    "stars":stars
+                })
 
                 log(
-                    f" BUY ✅ "
-                    f"Vol {volx:.1f}x | "
-                    f"RSI {rsi:.0f} | "
-                    f"W PASS | M PASS"
+                    f" BUY ✅ | Strength {strength}/100 "
+                    f"| {stars}"
                 )
 
             else:
-
-                log(
-                    " No qualifying setup"
-                )
+                log(" No qualifying setup")
 
         except Exception as e:
-
-            log(
-                f" Calculation error: {e}"
-            )
+            log(f" Calculation error: {e}")
 
         time.sleep(DELAY)
+
+    # =========================================================
+    # RANK FINAL PICKS
+    # =========================================================
+
+    picks=sorted(
+        picks,
+        key=lambda x:x["strength"],
+        reverse=True
+    )
 
     # =========================================================
     # FINAL RESULT
@@ -664,41 +579,67 @@ def main():
 
     log("")
     log("="*70)
-    log(
-        f"DONE - V3.5.7 COMPLETE - "
-        f"Picks: {len(picks)}"
-    )
+    log(f"DONE - V3.5.7 COMPLETE - Picks: {len(picks)}")
     log("="*70)
 
     if picks:
+
+        log("")
+        log("🏆 FINAL RANKING")
+        log("")
+
+        for i,p in enumerate(picks[:5],1):
+            log(
+                f"#{i} {p['sym']} "
+                f"{p['stars']} "
+                f"Strength {p['strength']}/100"
+            )
+
+        ranked_text=[]
+
+        for i,p in enumerate(picks[:5],1):
+
+            text=(
+                f"*#{i} {p['sym']} {p['stars']}*\n"
+                f"Strength: {p['strength']}/100\n"
+                f"LTP: ₹{p['close']:.1f} | "
+                f"52W: ₹{p['high_52']:.1f}\n"
+                f"Vol: {p['volx']:.1f}x | "
+                f"RSI: {p['rsi']:.0f}\n"
+                f"W: {p['week_latest']:.0f}>"
+                f"{p['week_previous']:.0f} "
+                f"M: {p['month_latest']:.0f}>"
+                f"{p['month_previous']:.0f}\n"
+                f"Risk: {p['risk_pct']:.1f}%\n"
+                f"SL: ₹{p['sl']:.0f} | "
+                f"TGT: ₹{p['tgt1']:.0f} / "
+                f"₹{p['tgt2']:.0f}\n"
+            )
+
+            ranked_text.append(text)
 
         msg=(
             f"🚀 *PURA NSE BUY - "
             f"{datetime.now().strftime('%d %b')} "
             f"- V3.5.7* 🚀\n\n"
-
             f"Total NSE: {len(nse_stocks)}\n"
             f"Top Candidates: {len(candidates)}\n"
             f"BUY: {len(picks)}\n\n"
-
+            f"🏆 *TOP 5 SETUP RANKING*\n\n"
+            f"Ranking = Setup Strength, "
+            f"NOT guaranteed probability.\n\n"
             f"*SWING MODE*\n"
             f"Daily: Swing Setup ✅\n"
             f"Weekly: Trend Confirmation ✅\n"
             f"Monthly: Quality Filter ✅\n"
             f"Completed Candle: ✅\n"
             f"Auto Orders: OFF\n\n"
-
             +
-            "\n".join(
-                picks[:15]
-            )
+            "\n".join(ranked_text)
         )
 
         send_telegram(msg)
-
-        log(
-            "Telegram BUY alert sent."
-        )
+        log("Telegram ranked BUY alert sent.")
 
     else:
 
@@ -706,16 +647,12 @@ def main():
             f"No picks today - V3.5.7\n"
             f"NSE: {len(nse_stocks)}\n"
             f"Candidates: {len(candidates)}\n\n"
-            f"Daily + Weekly + Monthly "
-            f"filters: No BUY"
+            f"Daily + Weekly + Monthly filters: No BUY"
         )
 
         send_telegram(msg)
 
-        log(
-            "No BUY today. "
-            "Telegram status sent."
-        )
+        log("No BUY today. Telegram status sent.")
 
 if __name__=="__main__":
 
@@ -723,19 +660,14 @@ if __name__=="__main__":
         main()
 
     except KeyboardInterrupt:
-
-        log(
-            "Stopped by user."
-        )
+        log("Stopped by user.")
 
     except Exception as e:
 
         log("")
-        log(
-            f"❌ FATAL ERROR: {e}"
-        )
+        log(f"❌ FATAL ERROR: {e}")
 
         send_telegram(
             f"❌ ANGEL ONE SCANNER V3.5.7 ERROR\n\n"
             f"{e}"
-    )
+                        )
