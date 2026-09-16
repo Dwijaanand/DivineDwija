@@ -1,20 +1,19 @@
-import os, time, requests, pyotp, pandas as pd
+import os, time, requests, pyotp, pandas as pd, random
 from datetime import datetime,timedelta
 from SmartApi import SmartConnect
 
-# ============ GITHUB SECRETS SE LEGA ============
 API_KEY=os.getenv("API_KEY")
 CLIENT_ID=os.getenv("CLIENT_ID")
 PASSWORD=os.getenv("PASSWORD")
 TOTP_SECRET=os.getenv("TOTP_SECRET")
 TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
-# ================================================
 
 MIN_PRICE=20.0
 MIN_SCORE=70
 MAX_SIGNALS=15
-DELAY=1.2
+DELAY=2.5
+REST_EVERY=10
 
 MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 HIGH_URL="https://www.nseindia.com/api/live-analysis-data-52weekhighstock"
@@ -27,7 +26,7 @@ def log(m): print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}",flush=True)
 
 def get_52w():
     NSE.get("https://www.nseindia.com",timeout=15)
-    h=NSE.get(HIGH_URL,timeout=25).json(); time.sleep(1); l=NSE.get(LOW_URL,timeout=25).json()
+    h=NSE.get(HIGH_URL,timeout=25).json(); time.sleep(2); l=NSE.get(LOW_URL,timeout=25).json()
     def ext(o):
         s=set()
         def w(x):
@@ -50,24 +49,44 @@ def load_master():
     return {str(x.get("symbol")).replace("-EQ",""):str(x.get("token")) for x in r if str(x.get("exch_seg"))=="NSE" and str(x.get("symbol","")).endswith("-EQ")}
 
 def login():
-    if not API_KEY or not CLIENT_ID or not PASSWORD or not TOTP_SECRET:
-        raise Exception(f"Secrets missing! API={bool(API_KEY)} CLIENT={bool(CLIENT_ID)}")
     obj=SmartConnect(api_key=API_KEY.strip())
     res=obj.generateSession(CLIENT_ID.strip(),PASSWORD.strip(),pyotp.TOTP(TOTP_SECRET.strip().replace(" ","")).now())
     if res.get("status"): log("Login OK"); return obj
     raise Exception(f"Login Fail {res}")
 
+# ===== YAHI FIX HAI - RATE LIMIT HANDLE =====
 def daily(obj,token):
     now=datetime.now(); frm=now-timedelta(days=750)
-    q={"exchange":"NSE","symboltoken":token,"interval":"ONE_DAY","fromdate":frm.strftime("%Y-%m-%d 09:15"),"todate":now.strftime("%Y-%m-%d 15:30")}
-    res=obj.getCandleData(q)
-    if not res or not res.get("data"): return None
-    df=pd.DataFrame(res["data"],columns=["time","open","high","low","close","volume"])
-    df["time"]=pd.to_datetime(df["time"])
-    for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-    df=df.dropna().sort_values("time").set_index("time")
-    df=df[df.index.date < datetime.now().date()]
-    return df if len(df)>=250 else None
+    q={"exchange":"NSE","symboltoken":str(token),"interval":"ONE_DAY","fromdate":frm.strftime("%Y-%m-%d 09:15"),"todate":now.strftime("%Y-%m-%d 15:30")}
+    for attempt in range(5):
+        try:
+            res=obj.getCandleData(q)
+            if not res or not res.get("data"):
+                msg=str(res).lower()
+                if "rate" in msg or "access" in msg or "exceed" in msg:
+                    wait=30+attempt*15+random.randint(1,5)
+                    log(f" Rate limit (response) wait {wait}s")
+                    time.sleep(wait)
+                    continue
+                return None
+            df=pd.DataFrame(res["data"],columns=["time","open","high","low","close","volume"])
+            df["time"]=pd.to_datetime(df["time"])
+            for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+            df=df.dropna().sort_values("time").set_index("time")
+            df=df[df.index.date < datetime.now().date()]
+            return df if len(df)>=250 else None
+        except Exception as e:
+            em=str(e).lower()
+            if "access denied" in em or "exceeding" in em or "rate" in em or "couldn't parse" in em:
+                wait=60+attempt*15+random.randint(5,10)
+                log(f" Rate limit (exception) wait {wait}s -> {e}")
+                time.sleep(wait)
+                continue
+            else:
+                log(f" Candle error {e}")
+                return None
+    return None
+# =============================================
 
 def ema(s,n): return s.ewm(span=n,adjust=False).mean()
 def rsi(s,p=14):
@@ -105,7 +124,7 @@ def analyze(df,sym,side):
         sl=max(float(d["low"].tail(10).min()), close-1.5*atr, float(dc["ema21"])*0.985)
         risk=close-sl
         if risk<=0 or not 2<=risk/close*100<=8: return None
-        return {"side":"BUY","symbol":sym,"setup":setup,"score":score,"price":close,"sl":sl,"t1":close+1.8*risk,"t2":close+3*risk,"risk":risk/close*100,"rsi":float(dc["rsi"]),"vol":volx,"why":why,"logic":"Monthly UP + Weekly UP + Daily Breakout | SL=SwingLow/ATR/EMA21"}
+        return {"side":"BUY","symbol":sym,"setup":setup,"score":score,"price":close,"sl":sl,"t1":close+1.8*risk,"t2":close+3*risk,"risk":risk/close*100,"rsi":float(dc["rsi"]),"vol":volx,"why":why,"logic":"Monthly UP + Weekly UP + Daily Breakout"}
     else:
         monthly_down=mc["close"]<mc["ema21"] and mc["close"]<mc1["close"]
         weekly_down=wc["close"]<wc["ema21"] and wc["close"]<wc["ema50"]
@@ -135,34 +154,38 @@ def fmt(s):
     icon="🟢" if s["side"]=="BUY" else "🔴"
     title="BUY" if s["side"]=="BUY" else "SELL/SHORT"
     why_txt="\n- ".join(s["why"])
-    return f"""{icon} *{title} {s['symbol']}* | Score {s['score']}\n*Setup:* {s['setup']}\n*Entry:* ₹{s['price']:.2f}\n*SL:* ₹{s['sl']:.2f} ({s['risk']:.1f}% Risk)\n*TGT1:* ₹{s['t1']:.2f} | *TGT2:* ₹{s['t2']:.2f}\nRSI {s['rsi']:.0f} | Vol {s['vol']:.1f}x\n*Chart Read:*\n- {why_txt}\n*Buy Logic:* {s['logic']}\n"""
+    return f"""{icon} *{title} {s['symbol']}* | Score {s['score']}\n*Setup:* {s['setup']}\n*Entry:* ₹{s['price']:.2f}\n*SL:* ₹{s['sl']:.2f} ({s['risk']:.1f}% Risk)\n*TGT1:* ₹{s['t1']:.2f} | *TGT2:* ₹{s['t2']:.2f}\nRSI {s['rsi']:.0f} | Vol {s['vol']:.1f}x\n*Chart Read:*\n- {why_txt}\n"""
 
 def main():
-    log("=== NSE 52W V3.1 ENTRY SL TGT ===")
+    log("=== NSE 52W V3.1 FIXED ===")
     high,low=get_52w(); master=load_master(); obj=login()
     ht={s:master[s] for s in high if s in master}
     lt={s:master[s] for s in low if s in master}
-    log(f"BUY:{len(ht)} SELL:{len(lt)} | Filter ₹{MIN_PRICE}+")
+    log(f"BUY:{len(ht)} SELL:{len(lt)}")
     sigs=[]
+    count=0
     for i,(sym,tok) in enumerate(ht.items(),1):
+        count+=1
+        if count%REST_EVERY==0: log(f"Resting 15s..."); time.sleep(15)
         log(f"[BUY {i}/{len(ht)}] {sym}"); df=daily(obj,tok); time.sleep(DELAY)
         if df is None: continue
         r=analyze(df,sym,"BUY")
-        if r: sigs.append(r); log(f"FOUND BUY {r['symbol']} {r['score']}")
+        if r: sigs.append(r)
     for i,(sym,tok) in enumerate(lt.items(),1):
+        count+=1
+        if count%REST_EVERY==0: log(f"Resting 15s..."); time.sleep(15)
         log(f"[SELL {i}/{len(lt)}] {sym}"); df=daily(obj,tok); time.sleep(DELAY)
         if df is None: continue
         r=analyze(df,sym,"SELL")
-        if r: sigs.append(r); log(f"FOUND SELL {r['symbol']} {r['score']}")
+        if r: sigs.append(r)
     sigs=sorted(sigs,key=lambda x:x["score"],reverse=True)[:MAX_SIGNALS]
     buys=[x for x in sigs if x["side"]=="BUY"]; sells=[x for x in sigs if x["side"]=="SELL"]
     log(f"DONE BUY:{len(buys)} SELL:{len(sells)}")
     if sigs:
-        head=f"🚀 *NSE 52W {datetime.now().strftime('%d %b %Y')}* | High:{len(high)} Low:{len(low)} | BUY:{len(buys)} SELL:{len(sells)}\nPrice Filter: ₹{MIN_PRICE}+\n\n"
+        head=f"🚀 *NSE 52W {datetime.now().strftime('%d %b %Y')}* | High:{len(high)} Low:{len(low)} | BUY:{len(buys)} SELL:{len(sells)}\n\n"
         body="\n".join(fmt(x) for x in sigs)
-        full=head+body
-        print(full); tg(full)
+        tg(head+body)
     else:
-        txt=f"No Setup Today High:{len(high)} Low:{len(low)}"; print(txt); tg(txt)
+        tg(f"No Setup Today High:{len(high)} Low:{len(low)}")
 
 if __name__=="__main__": main()
