@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install Dependencies
-        run: pip install smartapi-python pyotp pandas requests websocket-client
+        run: pip install smartapi-python pyotp pandas requests websocket-client logzero
       - name: Run 52 Week Scanner
         env:
           API_KEY: ${{ secrets.API_KEY }}
