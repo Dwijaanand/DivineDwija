@@ -1,122 +1,243 @@
-import os,time,requests,pyotp,pandas as pd,numpy as np
-from datetime import datetime,timedelta
+import os, time, requests, pyotp, pandas as pd
+from datetime import datetime, timedelta
 from SmartApi import SmartConnect
-import pytz
 
-API_KEY=os.getenv("API_KEY");CLIENT_ID=os.getenv("CLIENT_ID");PASSWORD=os.getenv("PASSWORD");TOTP_SECRET=os.getenv("TOTP_SECRET")
-TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN");TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
-MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-MIN_PRICE=100;MIN_VOL=200000;TOP_UNIVERSE=60;TOP_SIGNALS=3;MIN_SCORE=70;WATCH_SCORE=50;DELAY=.25;MIN_SL_PCT=0.004
-IST=pytz.timezone('Asia/Kolkata')
+# ============================================================
+# CHANDAN ATH BREAKOUT V2.1 - SWING SCANNER (FAST + STABLE)
+# ============================================================
 
-IPO_BLOCK = {"PINELABS-EQ","MEESHO-EQ","LENSKART-EQ","GLASSWALL-EQ","URBANCO-EQ","GROWW-EQ","SKYWAYS-EQ","CUPID-EQ","LUMINO-EQ","PWL-EQ","RIR-EQ","SAMBHV-EQ","EMIL-EQ"}
+API_KEY = os.getenv("API_KEY")
+CLIENT_ID = os.getenv("CLIENT_ID")
+PASSWORD = os.getenv("PASSWORD")
+TOTP_SECRET = os.getenv("TOTP_SECRET")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def tg(x):
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",data={"chat_id":TELEGRAM_CHAT_ID,"text":x},timeout=15)
-        except: pass
+MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-def login():
-    if not all([API_KEY,CLIENT_ID,PASSWORD,TOTP_SECRET]): raise RuntimeError("Credentials missing")
-    s=SmartConnect(api_key=API_KEY);r=s.generateSession(CLIENT_ID,PASSWORD,pyotp.TOTP(TOTP_SECRET).now())
-    if not r or not r.get("status"): raise RuntimeError(f"Login failed: {r}")
-    return s
+# ========== CORE FILTERS ==========
+MIN_PRICE = 100
+MIN_AVG_VOL = 300000
+VOL_X = 3.0
+NEAR_ATH_PERC = 5
 
-def master():
-    x=pd.DataFrame(requests.get(MASTER_URL,timeout=30).json())
-    x=x[(x["exch_seg"]=="NSE")&x["symbol"].astype(str).str.endswith("-EQ")].copy()
-    x["token"]=x["token"].astype(str);x["symbol"]=x["symbol"].astype(str);return x
+# ========== PERFORMANCE ==========
+TOP_LIQUID = 60
+QUOTE_BATCH = 50
+QUOTE_DELAY = 1.05
+CANDLE_DELAY = 0.40
 
-def quotes(s,tokens):
-    out=[]
-    for i in range(0,len(tokens),50):
+# ========== QUALITY ==========
+ATR_PERIOD = 14
+SWING_LOOKBACK = 10
+
+# ========== BLOCKLIST (IPO / operator) ==========
+BLOCKLIST = {"BAJAJHFL","MOTHERSON","TATATECH","JSWINFRA","IREDA"}
+
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        # Markdown me * _ ko safe karna
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
+        print("Telegram:", r.status_code, r.text[:200])
+    except Exception as e:
+        print("Telegram Fail:", e)
+
+def ema(s,p): return s.ewm(span=p, adjust=False).mean()
+
+def rsi(s,p=14):
+    d=s.diff(); g=d.clip(lower=0); l=-d.clip(upper=0)
+    ag=g.ewm(alpha=1/p, adjust=False).mean()
+    al=l.ewm(alpha=1/p, adjust=False).mean()
+    rs=ag/al.replace(0, pd.NA)
+    return 100-(100/(1+rs))
+
+def atr(df,p=14):
+    pc=df["close"].shift(1)
+    tr=pd.concat([df["high"]-df["low"], (df["high"]-pc).abs(), (df["low"]-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/p, adjust=False).mean()
+
+def get_candles(obj, token, interval):
+    try:
+        param = {
+            "exchange": "NSE",
+            "symboltoken": str(token),
+            "interval": interval,
+            "fromdate": (datetime.now()-timedelta(days=500)).strftime("%Y-%m-%d %H:%M"),
+            "todate": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+        res = obj.getCandleData(param)
+        if res and res.get("data"):
+            df = pd.DataFrame(res["data"], columns=["time","open","high","low","close","volume"])
+            for c in ["open","high","low","close","volume"]:
+                df[c]=pd.to_numeric(df[c], errors="coerce")
+            return df.dropna().reset_index(drop=True)
+    except Exception as e:
+        print(f"Candle error {token}: {e}")
+    return None
+
+def get_quotes(obj, token_list):
+    try:
+        res = obj.getMarketData("FULL", {"NSE": token_list})
+        data = (res or {}).get("data", {})
+        if isinstance(data, dict):
+            fetched = data.get("fetched", []) or data.get("data", [])
+            return fetched
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print("Quote error:", e)
+        return []
+
+# ========== LOGIN ==========
+print("\n======================================")
+print("CHANDAN ATH BREAKOUT V2.1 FAST")
+print("======================================\n")
+
+required = {"API_KEY":API_KEY,"CLIENT_ID":CLIENT_ID,"PASSWORD":PASSWORD,"TOTP_SECRET":TOTP_SECRET,"TELEGRAM_BOT_TOKEN":TELEGRAM_BOT_TOKEN,"TELEGRAM_CHAT_ID":TELEGRAM_CHAT_ID}
+missing=[k for k,v in required.items() if not v]
+if missing: raise RuntimeError("Missing: "+", ".join(missing))
+
+obj = SmartConnect(api_key=API_KEY)
+totp = pyotp.TOTP(TOTP_SECRET).now()
+session = obj.generateSession(CLIENT_ID, PASSWORD, totp)
+if not session or session.get("status") is False:
+    raise RuntimeError(f"Login failed: {session}")
+print("Login OK")
+
+# ========== MASTER ==========
+print("NSE Master load...")
+master = requests.get(MASTER_URL, timeout=30).json()
+ALL_TOKENS=[]; seen=set()
+for x in master:
+    if x.get("exch_seg")=="NSE" and x.get("symbol","").endswith("-EQ"):
+        sym=x["symbol"].replace("-EQ","")
+        if sym in BLOCKLIST or sym in seen: continue
+        seen.add(sym)
+        ALL_TOKENS.append({"sym":sym, "token":str(x["token"])})
+
+print(f"Total NSE-EQ: {len(ALL_TOKENS)}")
+
+# ========== FAST LIQUIDITY FILTER ==========
+print(f"\nFast filter: {len(ALL_TOKENS)} -> {TOP_LIQUID}")
+quote_rows=[]
+for start in range(0, len(ALL_TOKENS), QUOTE_BATCH):
+    batch = ALL_TOKENS[start:start+QUOTE_BATCH]
+    token_list=[x["token"] for x in batch]
+    fetched=get_quotes(obj, token_list)
+    token_map={x["token"]:x["sym"] for x in batch}
+    for q in fetched:
+        token=str(q.get("symbolToken",""))
+        sym=token_map.get(token, q.get("tradingSymbol","").replace("-EQ",""))
         try:
-            r=s.getMarketData("FULL",{"NSE":[str(x) for x in tokens[i:i+50]]});d=(r or {}).get("data",{})
-            out+=(d.get("fetched",[]) if isinstance(d,dict) else [])
-        except Exception as e: print("Quote error:",e)
-        time.sleep(1.05)
-    return pd.DataFrame(out)
+            ltp=float(q.get("ltp", q.get("close",0)))
+            vol=float(q.get("tradeVolume", q.get("volume",0)))
+        except: continue
+        if ltp>=MIN_PRICE and vol>0:
+            quote_rows.append({"sym":sym,"token":token,"ltp":ltp,"volume":vol})
+    print(f"Quotes {min(start+QUOTE_BATCH,len(ALL_TOKENS))}/{len(ALL_TOKENS)}")
+    time.sleep(QUOTE_DELAY)
 
-def candles(s,tok,days,interval):
-    try:
-        e=datetime.now();b=e-timedelta(days=days)
-        r=s.getCandleData({"exchange":"NSE","symboltoken":str(tok),"interval":interval,"fromdate":b.strftime("%Y-%m-%d %H:%M"),"todate":e.strftime("%Y-%m-%d %H:%M")})
-        d=(r or {}).get("data")
-        if not d:return None
-        x=pd.DataFrame(d,columns=["timestamp","open","high","low","close","volume"])
-        x["timestamp"]=pd.to_datetime(x.timestamp,errors="coerce")
-        for c in ["open","high","low","close","volume"]:x[c]=pd.to_numeric(x[c],errors="coerce")
-        return x.dropna(subset=["timestamp","close"]).sort_values("timestamp").reset_index(drop=True)
-    except: return None
+if not quote_rows: raise RuntimeError("No quotes")
 
-def is_old_enough(sym,tok,s):
-    if sym in IPO_BLOCK:
-        return False
-    try:
-        d=candles(s,tok,250,"ONE_DAY")
-        return d is not None and len(d)>=180
-    except:
-        return True
+quote_df=pd.DataFrame(quote_rows)
+quote_df=quote_df.sort_values("volume", ascending=False).drop_duplicates("sym")
+liquid=quote_df.head(TOP_LIQUID).copy()
+print(f"Liquid selected: {len(liquid)}")
 
-def rsi(s,n=14):
-    d=s.diff();u=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean();v=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
-    return 100-100/(1+u/v.replace(0,np.nan))
+# ========== SWING SCAN ==========
+picks=[]
+for _, row in liquid.iterrows():
+    sym=row["sym"]; token=row["token"]
+    print(f"Checking {sym}...")
 
-def feat(x):
-    x=x.copy();x["ema9"]=x.close.ewm(span=9,adjust=False).mean();x["ema20"]=x.close.ewm(span=20,adjust=False).mean();x["ema50"]=x.close.ewm(span=50,adjust=False).mean();x["rsi"]=rsi(x.close)
-    tr=pd.concat([x.high-x.low,(x.high-x.close.shift()).abs(),(x.low-x.close.shift()).abs()],axis=1).max(axis=1);x["atr"]=tr.ewm(span=14,adjust=False).mean();x["vavg20"]=x.volume.rolling(20).mean();x["volx"]=x.volume/x.vavg20.replace(0,np.nan)
-    x["prev20h"]=x.high.shift(1).rolling(20).max();x["prev20l"]=x.low.shift(1).rolling(20).min()
-    tp=(x.high+x.low+x.close)/3;day=x.timestamp.dt.date;x["pv"]=tp*x.volume;x["cv"]=x.volume.groupby(day).cumsum();x["cpv"]=x.pv.groupby(day).cumsum();x["vwap"]=x.cpv/x.cv.replace(0,np.nan)
-    return x
+    daily=get_candles(obj, token, "ONE_DAY"); time.sleep(CANDLE_DELAY)
+    if daily is None or len(daily)<220: continue
+    d=daily.iloc[-2]; hist=daily.iloc[:-1].copy()
+    avg_vol=hist["volume"].tail(20).mean()
+    if d["close"]<MIN_PRICE or avg_vol<MIN_AVG_VOL: continue
 
-def analyze(sym,tok,s):
-    d5=candles(s,tok,10,"FIVE_MINUTE");time.sleep(DELAY);d15=candles(s,tok,20,"FIFTEEN_MINUTE")
-    if d5 is None or d15 is None or len(d5)<60 or len(d15)<60:return None,"candle"
-    d5=feat(d5);d15=feat(d15);a=d5.iloc[-2];b=d15.iloc[-2]
-    if any(pd.isna(a[k]) for k in ["close","atr","rsi","volx","vwap"]) or pd.isna(a.prev20h) or pd.isna(a.prev20l):return None,"feature"
-    buy=(25 if b.close>b.ema20>b.ema50 else 0)+(20 if a.close>a.ema9>a.ema20 else 0)+(15 if a.close>a.vwap else 0)+(15 if 55<=a.rsi<=75 else 0)+(15 if a.volx>=1.5 else 0)+(10 if a.close>a.prev20h else 0)
-    sell=(25 if b.close<b.ema20<b.ema50 else 0)+(20 if a.close<a.ema9<a.ema20 else 0)+(15 if a.close<a.vwap else 0)+(15 if 25<=a.rsi<=45 else 0)+(15 if a.volx>=1.5 else 0)+(10 if a.close<a.prev20l else 0)
-    direction="BUY" if buy>=sell else "SELL";sc=max(buy,sell);entry=float(a.close);atr=max(float(a.atr),entry*.003)
-    if atr/entry < MIN_SL_PCT: return None,"sl_small"
-    sl=entry-atr if direction=="BUY" else entry+atr
-    return {"symbol":sym,"direction":direction,"score":int(sc),"entry":entry,"sl":sl,"t1":entry+(1.5*atr if direction=="BUY" else -1.5*atr),"t2":entry+(2.5*atr if direction=="BUY" else -2.5*atr),"rsi":float(a.rsi),"volx":float(a.volx),"token":str(tok)},None
+    weekly=get_candles(obj, token, "ONE_WEEK"); time.sleep(CANDLE_DELAY)
+    if weekly is None or len(weekly)<110: continue
+    w=weekly.iloc[-2]; whist=weekly.iloc[:-1].copy()
 
-def stars(s): return "★★★★★" if s>=85 else "★★★★☆" if s>=75 else "★★★☆☆" if s>=65 else "★★☆☆☆" if s>=55 else "★☆☆☆☆"
+    dma200=hist["close"].rolling(200).mean().iloc[-1]
+    if pd.isna(dma200): continue
+    high_52w=hist["high"].tail(252).max()
+    vol_x=float(d["volume"]/avg_vol) if avg_vol>0 else 0
 
-def main():
-    print(f"=== AI INTRADAY V6.4 FINAL {datetime.now(IST):%d %b %H:%M IST} ===");s=login();m=master();print("NSE-EQ:",len(m));q=quotes(s,m.token.tolist())
-    if q.empty: tg("⚠️ AI INTRADAY V6.4\nQuote API returned no data.");return
-    q["symbolToken"]=q["symbolToken"].astype(str);q["ltp"]=pd.to_numeric(q["ltp"],errors="coerce");q["tradeVolume"]=pd.to_numeric(q["tradeVolume"],errors="coerce")
-    q=q.dropna(subset=["symbolToken","ltp","tradeVolume"]);q=q[(q.ltp>=MIN_PRICE)&(q.tradeVolume>=MIN_VOL)].sort_values("tradeVolume",ascending=False).head(TOP_UNIVERSE)
-    q=q.merge(m[["symbol","token"]].drop_duplicates("token"),left_on="symbolToken",right_on="token",how="left").dropna(subset=["symbol"]);print("Liquid:",len(q))
-    stat={"candle":0,"feature":0,"ok":0,"score":0,"sl_small":0,"ipo_skip":0};res=[]
-    for _,r in q.iterrows():
-        z,why=analyze(r.symbol,r.symbolToken,s)
-        if not z:stat[why]+=1;continue
-        stat["ok"]+=1
-        if z["score"]>=MIN_SCORE:stat["score"]+=1
-        if z["score"]>=WATCH_SCORE:res.append(z)
-        print(f'{z["symbol"]:<18} {z["direction"]:<4} {z["score"]:>3} RSI {z["rsi"]:>5.1f} VolX {z["volx"]:>5.2f}')
-    res.sort(key=lambda x:x["score"],reverse=True)
-    final_res=[]
-    for z in res[:30]:
-        if not is_old_enough(z["symbol"], z["token"], s):
-            print(f"{z['symbol']} skip - IPO/new"); stat["ipo_skip"]+=1; time.sleep(0.3); continue
-        final_res.append(z)
-    final_res.sort(key=lambda x:x["score"],reverse=True)
-    sig=[x for x in final_res if x["score"]>=MIN_SCORE][:TOP_SIGNALS]
-    msg=[f"⚡ AI INTRADAY V6.4 | {datetime.now(IST):%d-%b %H:%M IST}",f"NSE-EQ: {len(m)} | Liquid: {len(q)} | Analysed: {stat['ok']} | IPO-Skip: {stat['ipo_skip']}",f"Score ≥{MIN_SCORE}: {stat['score']} | Alert limit: {TOP_SIGNALS}"]
-    if sig:
-        msg+=["","🔥 QUALIFYING SETUPS"]
-        for i,z in enumerate(sig,1):msg.append(f"\n#{i} {z['symbol']} {z['direction']} {stars(z['score'])} ({z['score']})\nEntry ₹{z['entry']:.2f} | SL ₹{z['sl']:.2f} | T1 ₹{z['t1']:.2f} | T2 ₹{z['t2']:.2f}\nRSI {z['rsi']:.1f} | Vol {z['volx']:.2f}x")
-    else:
-        msg+=["","⚠️ NO QUALIFYING SETUP"]
-        if final_res:
-            msg+=["","👀 NEAR-MISS WATCHLIST"]+[f"#{i} {z['symbol']} {z['direction']} {stars(z['score'])} {z['score']} | RSI {z['rsi']:.1f} | Vol {z['volx']:.2f}x" for i,z in enumerate(final_res[:8],1)]
-        else:msg+=["No stock reached the watch score."]
-    msg+=["",f"Diag: candle {stat['candle']} | feat {stat['feature']} | sl_small {stat['sl_small']}","Alert-only • No auto orders"]
-    out="\n".join(msg);print("\n"+out);tg(out)
+    weekly_uptrend=w["close"]>dma200
+    near_ath=d["close"]>=high_52w*(1-NEAR_ATH_PERC/100)
+    green=d["close"]>d["open"]
+    vol_blast=d["volume"]>(avg_vol*VOL_X)
+    breakout=d["close"]>=high_52w*0.995
 
-if __name__=="__main__":
-    try: main()
-    except Exception as e: tg(f"❌ AI INTRADAY ERROR\n{e}");raise
+    if not (weekly_uptrend and near_ath and green and vol_blast and breakout): continue
+
+    ema20=ema(hist["close"],20).iloc[-1]; ema50=ema(hist["close"],50).iloc[-1]; ema200=dma200
+    wema10=ema(whist["close"],10).iloc[-1]; wema30=ema(whist["close"],30).iloc[-1]; wema100=ema(whist["close"],100).iloc[-1]
+    daily_mtf=d["close"]>ema20>ema50>ema200
+    weekly_mtf=w["close"]>wema10>wema30>wema100
+
+    rsi14=rsi(hist["close"],14).iloc[-1]
+    if pd.isna(rsi14): continue
+
+    atr14=atr(hist,ATR_PERIOD).iloc[-1]
+    if pd.isna(atr14) or atr14<=0: continue
+    atr_pct=(atr14/d["close"])*100
+
+    score=50
+    if d["close"]>ema20: score+=8
+    if ema20>ema50: score+=7
+    if ema50>ema200: score+=5
+    if w["close"]>wema10: score+=6
+    if wema10>wema30: score+=5
+    if wema30>wema100: score+=4
+    if 55<=rsi14<=80: score+=5
+    if 60<=rsi14<=75: score+=3
+    if vol_x>=5: score+=4
+    elif vol_x>=4: score+=3
+    elif vol_x>=3: score+=2
+    if d["close"]>=high_52w*0.995: score+=3
+    if atr_pct>=1.0: score+=2
+    score=min(int(score),100)
+
+    if score>=90: stars="★★★★★"
+    elif score>=82: stars="★★★★☆"
+    elif score>=74: stars="★★★☆☆"
+    elif score>=66: stars="★★☆☆☆"
+    else: stars="★☆☆☆☆"
+
+    swing_low=hist["low"].tail(SWING_LOOKBACK).min()
+    sl=swing_low-(0.5*atr14)
+    if sl>=d["close"]: sl=d["close"]-atr14
+    risk=d["close"]-sl
+    if risk<=0: continue
+    t1=d["close"]+(risk*2); t2=d["close"]+(risk*3)
+
+    picks.append({
+        "Stock":sym,"LTP":round(float(d["close"]),2),"52W_High":round(float(high_52w),2),
+        "Vol_X":round(vol_x,2),"RSI":round(float(rsi14),1),"ATR_Pct":round(float(atr_pct),2),
+        "Score":score,"Stars":stars,"SL":round(float(sl),2),"TGT1":round(float(t1),2),"TGT2":round(float(t2),2),
+        "Daily_MTF":"YES" if daily_mtf else "NO","Weekly_MTF":"YES" if weekly_mtf else "NO","Signal":"BUY - BREAKOUT"
+    })
+    print(f"FOUND {sym} | {stars} Score {score} Vol {vol_x:.2f}x RSI {rsi14:.1f}")
+
+# ========== RESULT ==========
+if not picks:
+    msg=f"📉 *CHANDAN ATH BREAKOUT*\n🕒 {datetime.now().strftime('%d %b %Y %H:%M')}\n\nNSE: {len(ALL_TOKENS)} | Liquid: {len(liquid)} | Found: 0\n\nNo tight setup today.\n_Core: ATH Break + 3x Vol + Weekly Uptrend_"
+    print(msg); send_telegram(msg)
+else:
+    df=pd.DataFrame(picks).sort_values(by=["Score","Vol_X"], ascending=[False,False]).reset_index(drop=True)
+    df["Rank"]=df.index+1
+    msg=f"🚀 *CHANDAN ATH BREAKOUT V2.1* 🚀\n🕒 {datetime.now().strftime('%d %b %Y %H:%M')}\n\nNSE: {len(ALL_TOKENS)} | Liquid: {len(liquid)} | Found: {len(df)}\n🔥 *Strongest First*\n\n"
+    for _,r in df.iterrows():
+        mtf=[]
+        if r["Daily_MTF"]=="YES": mtf.append("Daily✓")
+        if r["Weekly_MTF"]=="YES": mtf.append("Weekly✓")
+        msg+=f"*#{int(r['Rank'])} {r['Stock']} {r['Stars']}*\nLTP: ₹{r['LTP']} | 52W: ₹{r['52W_High']}\nScore: {r['Score']}/100 | Vol: {r['Vol_X']}x\nRSI: {r['RSI']} | ATR: {r['ATR_Pct']}%\nMTF: {' '.join(mtf) or 'Core'}\nSL: ₹{r['SL']}\nTGT: ₹{r['TGT1']} / ₹{r['TGT2']}\n\n"
+    msg+="_No auto orders_"
+    print("\n"+msg); send_telegram(msg)
+    df.to_csv("Chandan_ALL_1800.csv", index=False)
+    print("CSV saved Chandan_ALL_1800.csv")
+
+print("\n[Finished]")
