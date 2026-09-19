@@ -1,118 +1,88 @@
 import os,time,requests,pyotp,pandas as pd,numpy as np
-from datetime import datetime
+from datetime import datetime,timedelta
 from SmartApi import SmartConnect
-
-API_KEY=os.getenv("API_KEY"); CLIENT_ID=os.getenv("CLIENT_ID"); PASSWORD=os.getenv("PASSWORD")
-TOTP_SECRET=os.getenv("TOTP_SECRET"); TG_BOT=os.getenv("TELEGRAM_BOT_TOKEN"); TG_CHAT=os.getenv("TELEGRAM_CHAT_ID")
+API_KEY=os.getenv("API_KEY");CLIENT_ID=os.getenv("CLIENT_ID");PASSWORD=os.getenv("PASSWORD");TOTP_SECRET=os.getenv("TOTP_SECRET")
+TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN");TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-MIN_PRICE=50; MIN_VOL=100000; TOP_UNIVERSE=45; TOP_SIGNALS=5; DELAY=.15
-
-def tg(msg):
-    if TG_BOT and TG_CHAT:
-        try: requests.post(f"https://api.telegram.org/bot{TG_BOT}/sendMessage",data={"chat_id":TG_CHAT,"text":msg},timeout=8)
+MIN_PRICE=50;MIN_VOL=100000;TOP_UNIVERSE=45;TOP_SIGNALS=5;MIN_SCORE=60;WATCH_SCORE=45;DELAY=.25
+def tg(x):
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",data={"chat_id":TELEGRAM_CHAT_ID,"text":x},timeout=15)
         except: pass
-
 def login():
     if not all([API_KEY,CLIENT_ID,PASSWORD,TOTP_SECRET]): raise RuntimeError("Credentials missing")
-    a=SmartConnect(api_key=API_KEY)
-    r=a.generateSession(CLIENT_ID,PASSWORD,pyotp.TOTP(TOTP_SECRET).now())
-    if not r.get("status"): raise RuntimeError(f"Angel login failed: {r}")
-    return a
-
-def master():
-    d=requests.get(MASTER_URL,timeout=30).json()
-    x=pd.DataFrame(d)
-    if "exch_seg" not in x.columns: raise RuntimeError("NSE master format changed: exch_seg missing")
-    x=x[(x["exch_seg"]=="NSE")&x["symbol"].astype(str).str.endswith("-EQ")].copy()
-    x["symbol"]=x["symbol"].astype(str).str.replace("-EQ","",regex=False)
-    x["token"]=x["token"].astype(str)
-    return x[["symbol","token"]].drop_duplicates("symbol")
-
-def quotes(a,rows):
-    out=[]
-    for i in range(0,len(rows),50):
-        b=rows.iloc[i:i+50]
-        try:
-            r=a.getMarketData({"mode":"FULL","exchangeTokens":{"NSE":b.token.tolist()}})
-            if r.get("status"):
-                for q in r.get("data",{}).get("fetched",[]) or []:
-                    out.append({"token":str(q.get("symbolToken")),"ltp":float(q.get("ltp") or 0),
-                                "vol":float(q.get("tradeVolume") or 0)})
-        except Exception: pass
-        time.sleep(DELAY)
-    return pd.DataFrame(out)
-
-def candles(a,token,interval,days):
-    p={"exchange":"NSE","symboltoken":str(token),"interval":interval,
-       "fromdate":(pd.Timestamp.now()-pd.Timedelta(days=days)).strftime("%Y-%m-%d 09:15"),
-       "todate":pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")}
-    try:
-        r=a.getCandleData(p)
-        if not r.get("status") or not r.get("data"): return pd.DataFrame()
-        d=pd.DataFrame(r["data"],columns=["time","open","high","low","close","volume"])
-        for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
-        return d.dropna()
-    except Exception: return pd.DataFrame()
-
-def feat(d):
-    if len(d)<55:return None
-    d=d.copy(); c=d.close
-    d["e9"]=c.ewm(span=9,adjust=False).mean(); d["e20"]=c.ewm(span=20,adjust=False).mean(); d["e50"]=c.ewm(span=50,adjust=False).mean()
-    z=c.diff(); up=z.clip(lower=0).rolling(14).mean(); dn=(-z.clip(upper=0)).rolling(14).mean()
-    d["rsi"]=100-100/(1+up/dn.replace(0,np.nan))
-    d["vwap"]=(d.close*d.volume).cumsum()/d.volume.replace(0,np.nan).cumsum()
-    tr=pd.concat([d.high-d.low,(d.high-d.close.shift()).abs(),(d.low-d.close.shift()).abs()],axis=1).max(axis=1)
-    d["atr"]=tr.rolling(14).mean(); d["volx"]=d.volume/d.volume.rolling(20).mean()
-    d["hh"]=d.high.shift(1).rolling(20).max(); d["ll"]=d.low.shift(1).rolling(20).min()
-    return d
-
-def scan(a,m):
-    q=quotes(a,m)
-    if q.empty: return []
-    m=m.merge(q,on="token",how="inner")
-    m=m[(m.ltp>=MIN_PRICE)&(m.vol>=MIN_VOL)].sort_values("vol",ascending=False).head(TOP_UNIVERSE)
-    print("Liquid candidates:",len(m))
-    ans=[]
-    for _,r in m.iterrows():
-        d5=feat(candles(a,r.token,"FIVE_MINUTE",3)); d15=feat(candles(a,r.token,"FIFTEEN_MINUTE",7))
-        if d5 is None or d15 is None: continue
-        x=d5.iloc[-2]; y=d15.iloc[-2]
-        if not np.isfinite(x.atr) or x.atr<=0: continue
-        lb=0; ss=0
-        lb+=25 if y.close>y.e20>y.e50 else 0
-        lb+=20 if x.close>x.e9>x.e20 else 0
-        lb+=15 if x.close>x.vwap else 0
-        lb+=15 if 55<=x.rsi<=75 else 0
-        lb+=15 if x.volx>=1.5 else 0
-        lb+=10 if x.close>x.hh else 0
-        ss+=25 if y.close<y.e20<y.e50 else 0
-        ss+=20 if x.close<x.e9<x.e20 else 0
-        ss+=15 if x.close<x.vwap else 0
-        ss+=15 if 25<=x.rsi<=45 else 0
-        ss+=15 if x.volx>=1.5 else 0
-        ss+=10 if x.close<x.ll else 0
-        score=max(lb,ss)
-        if score<60: continue
-        side="BUY" if lb>=ss else "SELL"; e=float(x.close); atr=float(x.atr)
-        sl=e-atr if side=="BUY" else e+atr; risk=abs(e-sl)
-        t1=e+1.5*risk if side=="BUY" else e-1.5*risk
-        t2=e+2.5*risk if side=="BUY" else e-2.5*risk
-        ans.append((score,{"symbol":r["symbol"],"side":side,"score":score,"entry":e,"sl":sl,"t1":t1,"t2":t2,"rsi":float(x.rsi),"volx":float(x.volx)}))
-        time.sleep(DELAY)
-    return [x[1] for x in sorted(ans,key=lambda z:z[0],reverse=True)[:TOP_SIGNALS]]
-
-def message(rows):
-    if not rows:return "⚠️ AI INTRADAY SCANNER\nNo qualifying setup found."
-    s=f"🔥 AI INTRADAY SCANNER v1.2\n{datetime.now().strftime('%d-%m-%Y %H:%M')} IST\n15M Trend + 5M Setup\nCompleted Candle Logic\nStrongest Setup First\n\n"
-    for i,r in enumerate(rows,1):
-        n=max(1,min(5,round(r["score"]/20))); stars="★"*n+"☆"*(5-n)
-        s+=f"#{i} {r['symbol']} {stars}\n{r['side']} | Score {r['score']}/100\nEntry ₹{r['entry']:.2f}\nSL ₹{r['sl']:.2f}\nT1 ₹{r['t1']:.2f} | T2 ₹{r['t2']:.2f}\nRSI {r['rsi']:.1f} | Vol {r['volx']:.1f}x\n\n"
+    s=SmartConnect(api_key=API_KEY);r=s.generateSession(CLIENT_ID,PASSWORD,pyotp.TOTP(TOTP_SECRET).now())
+    if not r or not r.get("status"): raise RuntimeError(f"Login failed: {r}")
     return s
-
+def master():
+    x=pd.DataFrame(requests.get(MASTER_URL,timeout=30).json())
+    x=x[(x["exch_seg"]=="NSE")&x["symbol"].astype(str).str.endswith("-EQ")].copy()
+    x["token"]=x["token"].astype(str);x["symbol"]=x["symbol"].astype(str);return x
+def quotes(s,tokens):
+    out=[]
+    for i in range(0,len(tokens),50):
+        try:
+            r=s.getMarketData("FULL",{"NSE":[str(x) for x in tokens[i:i+50]]});d=(r or {}).get("data",{})
+            out+=(d.get("fetched",[]) if isinstance(d,dict) else [])
+        except Exception as e: print("Quote error:",e)
+        time.sleep(1.05)
+    return pd.DataFrame(out)
+def candles(s,tok,days,interval):
+    try:
+        e=datetime.now();b=e-timedelta(days=days)
+        r=s.getCandleData({"exchange":"NSE","symboltoken":str(tok),"interval":interval,"fromdate":b.strftime("%Y-%m-%d %H:%M"),"todate":e.strftime("%Y-%m-%d %H:%M")})
+        d=(r or {}).get("data")
+        if not d:return None
+        x=pd.DataFrame(d,columns=["timestamp","open","high","low","close","volume"])
+        x["timestamp"]=pd.to_datetime(x.timestamp,errors="coerce")
+        for c in ["open","high","low","close","volume"]:x[c]=pd.to_numeric(x[c],errors="coerce")
+        return x.dropna(subset=["timestamp","close"]).sort_values("timestamp").reset_index(drop=True)
+    except: return None
+def rsi(s,n=14):
+    d=s.diff();u=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean();v=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
+    return 100-100/(1+u/v.replace(0,np.nan))
+def feat(x):
+    x=x.copy();x["ema9"]=x.close.ewm(span=9,adjust=False).mean();x["ema20"]=x.close.ewm(span=20,adjust=False).mean();x["ema50"]=x.close.ewm(span=50,adjust=False).mean();x["rsi"]=rsi(x.close)
+    tr=pd.concat([x.high-x.low,(x.high-x.close.shift()).abs(),(x.low-x.close.shift()).abs()],axis=1).max(axis=1);x["atr"]=tr.ewm(span=14,adjust=False).mean();x["vavg20"]=x.volume.rolling(20).mean();x["volx"]=x.volume/x.vavg20.replace(0,np.nan)
+    x["prev20h"]=x.high.shift(1).rolling(20).max();x["prev20l"]=x.low.shift(1).rolling(20).min()
+    tp=(x.high+x.low+x.close)/3;day=x.timestamp.dt.date;x["pv"]=tp*x.volume;x["cv"]=x.volume.groupby(day).cumsum();x["cpv"]=x.pv.groupby(day).cumsum();x["vwap"]=x.cpv/x.cv.replace(0,np.nan)
+    return x
+def analyze(sym,tok,s):
+    d5=candles(s,tok,10,"FIVE_MINUTE");time.sleep(DELAY);d15=candles(s,tok,20,"FIFTEEN_MINUTE")
+    if d5 is None or d15 is None or len(d5)<60 or len(d15)<60:return None,"candle"
+    d5=feat(d5);d15=feat(d15);a=d5.iloc[-2];b=d15.iloc[-2]
+    if any(pd.isna(a[k]) for k in ["close","atr","rsi","volx","vwap"]) or pd.isna(a.prev20h) or pd.isna(a.prev20l):return None,"feature"
+    buy=(25 if b.close>b.ema20>b.ema50 else 0)+(20 if a.close>a.ema9>a.ema20 else 0)+(15 if a.close>a.vwap else 0)+(15 if 55<=a.rsi<=75 else 0)+(15 if a.volx>=1.5 else 0)+(10 if a.close>a.prev20h else 0)
+    sell=(25 if b.close<b.ema20<b.ema50 else 0)+(20 if a.close<a.ema9<a.ema20 else 0)+(15 if a.close<a.vwap else 0)+(15 if 25<=a.rsi<=45 else 0)+(15 if a.volx>=1.5 else 0)+(10 if a.close<a.prev20l else 0)
+    direction="BUY" if buy>=sell else "SELL";sc=max(buy,sell);entry=float(a.close);atr=max(float(a.atr),entry*.003);sl=entry-atr if direction=="BUY" else entry+atr
+    return {"symbol":sym,"direction":direction,"score":int(sc),"entry":entry,"sl":sl,"t1":entry+(1.5*atr if direction=="BUY" else -1.5*atr),"t2":entry+(2.5*atr if direction=="BUY" else -2.5*atr),"rsi":float(a.rsi),"volx":float(a.volx)},None
+def stars(s): return "★★★★★" if s>=85 else "★★★★☆" if s>=75 else "★★★☆☆" if s>=65 else "★★☆☆☆" if s>=55 else "★☆☆☆☆"
 def main():
-    print("AI INTRADAY SCANNER v1.2")
-    a=login(); m=master(); print("NSE-EQ:",len(m))
-    rows=scan(a,m); s=message(rows); print(s); tg(s)
-
-if __name__=="__main__": main()
-
+    print("=== AI INTRADAY SCANNER V1.3 DIAGNOSTIC ===");s=login();m=master();print("NSE-EQ:",len(m));q=quotes(s,m.token.tolist())
+    if q.empty: tg("⚠️ AI INTRADAY SCANNER V1.3\nQuote API returned no data.");return
+    q["symbolToken"]=q["symbolToken"].astype(str);q["ltp"]=pd.to_numeric(q["ltp"],errors="coerce");q["tradeVolume"]=pd.to_numeric(q["tradeVolume"],errors="coerce")
+    q=q.dropna(subset=["symbolToken","ltp","tradeVolume"]);q=q[(q.ltp>=MIN_PRICE)&(q.tradeVolume>=MIN_VOL)].sort_values("tradeVolume",ascending=False).head(TOP_UNIVERSE)
+    q=q.merge(m[["symbol","token"]].drop_duplicates("token"),left_on="symbolToken",right_on="token",how="left").dropna(subset=["symbol"]);print("Liquid:",len(q))
+    stat={"candle":0,"feature":0,"ok":0,"score":0};res=[]
+    for _,r in q.iterrows():
+        z,why=analyze(r.symbol,r.symbolToken,s)
+        if not z:stat[why]+=1;continue
+        stat["ok"]+=1
+        if z["score"]>=MIN_SCORE:stat["score"]+=1
+        if z["score"]>=WATCH_SCORE:res.append(z)
+        print(f'{z["symbol"]:<18} {z["direction"]:<4} {z["score"]:>3} RSI {z["rsi"]:>5.1f} VolX {z["volx"]:>5.2f}')
+    res.sort(key=lambda x:x["score"],reverse=True);sig=[x for x in res if x["score"]>=MIN_SCORE][:TOP_SIGNALS]
+    msg=[f"⚡ AI INTRADAY SCANNER V1.3 | {datetime.now():%d-%b %H:%M}",f"NSE-EQ: {len(m)} | Liquid: {len(q)} | Analysed: {stat['ok']}",f"Score ≥{MIN_SCORE}: {stat['score']} | Alert limit: {TOP_SIGNALS}"]
+    if sig:
+        msg+=["","🔥 QUALIFYING SETUPS"]
+        for i,z in enumerate(sig,1):msg.append(f"\n#{i} {z['symbol']} {z['direction']} {stars(z['score'])} ({z['score']})\nEntry ₹{z['entry']:.2f} | SL ₹{z['sl']:.2f} | T1 ₹{z['t1']:.2f} | T2 ₹{z['t2']:.2f}\nRSI {z['rsi']:.1f} | Vol {z['volx']:.2f}x")
+    else:
+        msg+=["","⚠️ NO QUALIFYING SETUP"]
+        if res:
+            msg+=["","👀 NEAR-MISS WATCHLIST (NOT TRADE SIGNALS)"]+[f"#{i} {z['symbol']} {z['direction']} {stars(z['score'])} {z['score']} | RSI {z['rsi']:.1f} | Vol {z['volx']:.2f}x" for i,z in enumerate(res[:8],1)]
+        else:msg+=["No stock reached the watch score."]
+    msg+=["",f"Diagnostics: candle-miss {stat['candle']} | feature-miss {stat['feature']}","Alert-only • No automatic orders"]
+    out="\n".join(msg);print("\n"+out);tg(out)
+if __name__=="__main__":
+    try: main()
+    except Exception as e: tg(f"❌ AI INTRADAY SCANNER ERROR\n{e}");raise
