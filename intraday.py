@@ -42,11 +42,7 @@ def candles(s,tok,days,interval):
         return x.dropna(subset=["timestamp","close"]).sort_values("timestamp").reset_index(drop=True)
     except: return None
 def is_old_enough(sym,tok,s):
-    if sym in IPO_BLOCK: return False
-    try:
-        d=candles(s,tok,250,"ONE_DAY")
-        return d is not None and len(d)>=180
-    except: return True
+    return sym not in IPO_BLOCK
 def rsi(s,n=14):
     d=s.diff();u=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean();v=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
     return 100-100/(1+u/v.replace(0,np.nan))
@@ -69,8 +65,8 @@ def analyze(sym,tok,s):
     return {"symbol":sym,"direction":direction,"score":int(sc),"entry":entry,"sl":sl,"t1":entry+(1.5*atr if direction=="BUY" else -1.5*atr),"t2":entry+(2.5*atr if direction=="BUY" else -2.5*atr),"rsi":float(a.rsi),"volx":float(a.volx),"token":str(tok)},None
 def stars(s): return "★★★★★" if s>=85 else "★★★★☆" if s>=75 else "★★★☆☆" if s>=65 else "★★☆☆☆" if s>=55 else "★☆☆☆☆"
 def main():
-    print(f"=== AI INTRADAY V6.4 FINAL {datetime.now(IST):%d %b %H:%M IST} ===");s=login();m=master();print("NSE-EQ:",len(m));q=quotes(s,m.token.tolist())
-    if q.empty: tg("⚠️ AI INTRADAY V6.4\nQuote API returned no data.");return
+    print(f"=== AI INTRADAY V6.5 FINAL {datetime.now(IST):%d %b %H:%M IST} ===");s=login();m=master();print("NSE-EQ:",len(m));q=quotes(s,m.token.tolist())
+    if q.empty: tg("⚠️ AI INTRADAY V6.5\nQuote API returned no data.");return
     q["symbolToken"]=q["symbolToken"].astype(str);q["ltp"]=pd.to_numeric(q["ltp"],errors="coerce");q["tradeVolume"]=pd.to_numeric(q["tradeVolume"],errors="coerce")
     q=q.dropna(subset=["symbolToken","ltp","tradeVolume"]);q=q[(q.ltp>=MIN_PRICE)&(q.tradeVolume>=MIN_VOL)].sort_values("tradeVolume",ascending=False).head(TOP_UNIVERSE)
     q=q.merge(m[["symbol","token"]].drop_duplicates("token"),left_on="symbolToken",right_on="token",how="left").dropna(subset=["symbol"]);print("Liquid:",len(q))
@@ -86,11 +82,11 @@ def main():
     final_res=[]
     for z in res[:30]:
         if not is_old_enough(z["symbol"], z["token"], s):
-            print(f"{z['symbol']} skip - IPO/new"); stat["ipo_skip"]+=1; time.sleep(0.3); continue
+            print(f"{z['symbol']} skip - IPO/new"); stat["ipo_skip"]+=1; continue
         final_res.append(z)
     final_res.sort(key=lambda x:x["score"],reverse=True)
     sig=[x for x in final_res if x["score"]>=MIN_SCORE][:TOP_SIGNALS]
-    msg=[f"⚡ AI INTRADAY V6.4 | {datetime.now(IST):%d-%b %H:%M IST}",f"NSE-EQ: {len(m)} | Liquid: {len(q)} | Analysed: {stat['ok']} | IPO-Skip: {stat['ipo_skip']}",f"Score ≥{MIN_SCORE}: {stat['score']} | Alert limit: {TOP_SIGNALS}"]
+    msg=[f"⚡ AI INTRADAY V6.5 | {datetime.now(IST):%d-%b %H:%M IST}",f"NSE-EQ: {len(m)} | Liquid: {len(q)} | Analysed: {stat['ok']} | IPO-Skip: {stat['ipo_skip']}",f"Score ≥{MIN_SCORE}: {stat['score']} | Alert limit: {TOP_SIGNALS}"]
     if sig:
         msg+=["","🔥 QUALIFYING SETUPS"]
         for i,z in enumerate(sig,1):msg.append(f"\n#{i} {z['symbol']} {z['direction']} {stars(z['score'])} ({z['score']})\nEntry ₹{z['entry']:.2f} | SL ₹{z['sl']:.2f} | T1 ₹{z['t1']:.2f} | T2 ₹{z['t2']:.2f}\nRSI {z['rsi']:.1f} | Vol {z['volx']:.2f}x")
