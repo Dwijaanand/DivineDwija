@@ -4,3 +4,4 @@ requests
 pyotp
 logzero
 websocket-client
+numpy
