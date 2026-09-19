@@ -7,7 +7,7 @@ API_KEY=os.getenv("API_KEY");CLIENT_ID=os.getenv("CLIENT_ID");PASSWORD=os.getenv
 TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN");TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 MIN_PRICE=100;MIN_VOL=200000;TOP_UNIVERSE=60;TOP_SIGNALS=3;MIN_SCORE=70;WATCH_SCORE=50;DELAY=.30;MIN_SL_PCT=.004
-WHOLE_BONUS=6;NR7_BONUS=7;OPTIONS_MAX=12;OPTIONS_DAYS=90;OPTIONS_STRIKES=2;OPTION_DELAY=.35
+WHOLE_BONUS=6;NR7_BONUS=7;OPTIONS_MAX=12;OPTIONS_DAYS=20;OPTIONS_STRIKES=2;OPTION_DELAY=.35
 OPTION_CACHE={}
 IST=pytz.timezone("Asia/Kolkata")
 IPO_BLOCK={"PINELABS-EQ","MEESHO-EQ","LENSKART-EQ","GLASSWALL-EQ","URBANCO-EQ","GROWW-EQ","SKYWAYS-EQ","CUPID-EQ","LUMINO-EQ","PWL-EQ","RIR-EQ","SAMBHV-EQ","EMIL-EQ"}
@@ -30,7 +30,8 @@ def equity_master(m): return m[(m["exch_seg"]=="NSE")&m["symbol"].str.endswith("
 
 def option_master(m):
     x=m[m["exch_seg"]=="NFO"].copy()
-    x["expiry_dt"]=pd.to_datetime(x.get("expiry"),errors="coerce")
+    # FIX: Warning hatane ke liye format="mixed"
+    x["expiry_dt"]=pd.to_datetime(x.get("expiry"), errors="coerce", format="mixed")
     x["strike_num"]=pd.to_numeric(x.get("strike"),errors="coerce")
     x=x[x["symbol"].str.upper().str.contains("CE|PE",regex=True,na=False)].copy()
     return x
@@ -92,10 +93,9 @@ def find_option_contracts(om,sym,spot):
     u=normalize_underlying(sym);x=om[om["symbol"].str.upper().str.startswith(u)].copy()
     if x.empty:return x
     today=pd.Timestamp.now().normalize()
-    # NEXT 3 MONTH = today se 90 din tak ke expiry
     x=x[(x["expiry_dt"]>=today)&(x["expiry_dt"]<=today+pd.Timedelta(days=90))].copy()
     if x.empty:return x
-    exps=sorted(x["expiry_dt"].dropna().unique())[:3] # next 3 expiry only
+    exps=sorted(x["expiry_dt"].dropna().unique())[:3]
     x=x[x["expiry_dt"].isin(exps)].copy()
     selected=[]
     for exp in exps:
@@ -117,7 +117,7 @@ def option_flow(s,om,sym,spot):
     ce_vol=0.;pe_vol=0.;ce_move=[];pe_move=[];used=0
     for _,c in contracts.iterrows():
         if used>=OPTIONS_MAX:break
-        d=candles(s,c["token"],20,"ONE_DAY","NFO");time.sleep(OPTION_DELAY)
+        d=candles(s,c["token"],OPTIONS_DAYS,"ONE_DAY","NFO");time.sleep(OPTION_DELAY)
         if d is None or len(d)<10:continue
         used+=1;vol=float(pd.to_numeric(d.volume,errors="coerce").fillna(0).sum());first=float(d.iloc[0].close);last=float(d.iloc[-1].close);move=(last-first)/first if first>0 else 0
         if str(c["symbol"]).upper().endswith("CE"):ce_vol+=vol;ce_move.append(move)
@@ -155,10 +155,10 @@ def stars(s):
     return "★☆☆☆☆"
 
 def main():
-    print(f"=== AI INTRADAY V7.1 FAST {datetime.now(IST):%d %b %H:%M IST} ===");s=login();m=master();em=equity_master(m);om=option_master(m)
+    print(f"=== AI INTRADAY V7.2 FIXED {datetime.now(IST):%d %b %H:%M IST} ===");s=login();m=master();em=equity_master(m);om=option_master(m)
     print(f"NSE-EQ: {len(em)} | NFO: {len(om)}")
     q=quotes(s,em.token.tolist())
-    if q.empty:tg("⚠️ V7.1 No quotes");return
+    if q.empty:tg("⚠️ V7.2 No quotes");return
     q["symbolToken"]=q["symbolToken"].astype(str);q["ltp"]=pd.to_numeric(q["ltp"],errors="coerce");q["tradeVolume"]=pd.to_numeric(q["tradeVolume"],errors="coerce")
     q=q.dropna(subset=["symbolToken","ltp","tradeVolume"]);q=q[(q.ltp>=MIN_PRICE)&(q.tradeVolume>=MIN_VOL)].sort_values("tradeVolume",ascending=False).head(TOP_UNIVERSE)
     q=q.merge(em[["symbol","token"]].drop_duplicates("token"),left_on="symbolToken",right_on="token",how="left").dropna(subset=["symbol"])
@@ -171,9 +171,8 @@ def main():
             continue
         stat["ok"]+=1;res.append(z)
         print(f'{z["symbol"]:<18} {z["direction"]:<4} Tech {z["tech_score"]:>3} RSI {z["rsi"]:.1f}')
-
     res.sort(key=lambda x:x["tech_score"],reverse=True)
-    top_for_option=res[:12] # NEXT 3 MONTH OPTION SIRF TOP 12 PE
+    top_for_option=res[:12]
     print(f"\n--- Checking Next 3 Month Option Flow for Top {len(top_for_option)} ---")
     final_res=[]
     for z in top_for_option:
@@ -183,16 +182,12 @@ def main():
         z["options_bias"]=opt["bias"];z["options_score"]=opt_bonus;z["options_ratio"]=float(opt["ratio"]);z["options_contracts"]=opt["contracts"]
         final_res.append(z)
         print(f'{z["symbol"]} -> Opt {opt["bias"]} ratio {opt["ratio"]:.2f} -> Final {z["score"]}')
-
-    # baaki bache hue bina option ke
     for z in res[12:]:
         z["score"]=z["tech_score"]+z["whole_bonus"]+z["nr7_bonus"];z["options_bias"]="SKIP";z["options_score"]=0;z["options_ratio"]=0;z["options_contracts"]=0
         final_res.append(z)
-
     final_res.sort(key=lambda x:x["score"],reverse=True)
     sig=[x for x in final_res if x["score"]>=MIN_SCORE][:TOP_SIGNALS]
-
-    msg=[f"⚡ AI INTRADAY V7.1 FAST | {datetime.now(IST):%d-%b %H:%M IST}",f"NSE-EQ: {len(em)} | Liquid: {len(q)} | Analysed: {stat['ok']} | IPO Skip: {stat['ipo_skip']}","","🧠 Stack: 5m/15m + Whole + NR7 + 3M Option(Top12)"]
+    msg=[f"⚡ AI INTRADAY V7.2 FIXED | {datetime.now(IST):%d-%b %H:%M IST}",f"NSE-EQ: {len(em)} | Liquid: {len(q)} | Analysed: {stat['ok']} | IPO Skip: {stat['ipo_skip']}","","🧠 Stack: 5m/15m + Whole + NR7 + 3M Option(Top12)"]
     if sig:
         msg+=["","🔥 QUALIFYING SETUPS (3M Option Confirmed)"]
         for i,z in enumerate(sig,1):
@@ -206,4 +201,4 @@ def main():
 
 if __name__=="__main__":
     try:main()
-    except Exception as e:tg(f"❌ V7.1 ERROR\n{e}");raise
+    except Exception as e:tg(f"❌ V7.2 ERROR\n{e}");raise
