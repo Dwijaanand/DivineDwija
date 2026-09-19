@@ -12,6 +12,8 @@ WHOLE_BONUS=6;NR7_BONUS=7;OPTIONS_MAX=10;OPTIONS_DAYS=20;OPTIONS_STRIKES=2;OPTIO
 OPTION_CACHE={}; ALL_UNDERLYINGS=None
 IST=pytz.timezone("Asia/Kolkata")
 IPO_BLOCK={"PINELABS-EQ","MEESHO-EQ","LENSKART-EQ","GLASSWALL-EQ","URBANCO-EQ","GROWW-EQ","SKYWAYS-EQ","CUPID-EQ","LUMINO-EQ","PWL-EQ","RIR-EQ","SAMBHV-EQ","EMIL-EQ"}
+# Manual fix - Angel ka naam alag hai
+UNDERLYING_FIX={"MOTHERSON":"MOTHERSUMI","M_M":"M&M","M&M":"M&M","BAJAJ-AUTO":"BAJAJAUTO","BAJAJ_AUTO":"BAJAJAUTO","CHOLAFIN":"CHOLAFIN"}
 
 def tg(x):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -47,14 +49,12 @@ def get_all_underlyings(om):
 
 def find_best_underlying(equity_base):
     global ALL_UNDERLYINGS
+    if equity_base in UNDERLYING_FIX:
+        return UNDERLYING_FIX[equity_base]
     if not ALL_UNDERLYINGS: return equity_base
-    # FIX: Exact hai to wahi return, warna galat map mat kar
-    if equity_base in ALL_UNDERLYINGS:
-        return equity_base
-    # Sirf same 3 letter walo me fuzzy search, cutoff 85%
+    if equity_base in ALL_UNDERLYINGS: return equity_base
     candidates=[u for u in ALL_UNDERLYINGS if u[:3]==equity_base[:3]]
-    if not candidates:
-        return equity_base
+    if not candidates: return equity_base
     match=difflib.get_close_matches(equity_base, candidates, n=1, cutoff=0.85)
     return match[0] if match else equity_base
 
@@ -114,11 +114,6 @@ def find_option_contracts(om,sym,spot):
     if ALL_UNDERLYINGS is None: ALL_UNDERLYINGS=get_all_underlyings(om)
     base=str(sym).replace("-EQ","").upper()
     best_u=find_best_underlying(base)
-    # Agar F&O list me nahi hai to empty return
-    if best_u not in ALL_UNDERLYINGS and base not in ALL_UNDERLYINGS:
-        # base hi F&O me nahi hai
-        if base!= best_u: # fuzzy bhi fail
-            return pd.DataFrame()
     x=om[om["symbol"].str.upper().str.startswith(best_u, na=False)].copy()
     if x.empty:return x
     today=pd.Timestamp.now().normalize()
@@ -141,7 +136,8 @@ def option_flow(s,om,sym,spot):
     key=f"{sym}_{round(float(spot),2)}"
     if key in OPTION_CACHE:return OPTION_CACHE[key]
     contracts=find_option_contracts(om,sym,spot)
-    if contracts.empty: return {"score":0,"bias":"NEUTRAL","ratio":0,"contracts":0,"mapped":find_best_underlying(sym.replace("-EQ","").upper())}
+    if contracts.empty:
+        return {"score":0,"bias":"NEUTRAL","ratio":0,"contracts":0,"mapped":find_best_underlying(sym.replace("-EQ","").upper())}
     ce_vol=0.;pe_vol=0.;ce_move=[];pe_move=[];used=0
     for _,c in contracts.iterrows():
         if used>=OPTIONS_MAX:break
@@ -186,12 +182,12 @@ def stars(s):
     return "★★☆☆☆"
 
 def main():
-    print(f"=== AI INTRADAY V7.5 FINAL {datetime.now(IST):%d %b %H:%M IST} ===", flush=True)
+    print(f"=== AI INTRADAY V7.6 FINAL {datetime.now(IST):%d %b %H:%M IST} ===", flush=True)
     s=login();m=master();em=equity_master(m);om=option_master(m)
     global ALL_UNDERLYINGS; ALL_UNDERLYINGS=get_all_underlyings(om)
     print(f"NSE:{len(em)} NFO:{len(om)} Underlyings:{len(ALL_UNDERLYINGS)}", flush=True)
     q=quotes(s,em.token.tolist())
-    if q.empty:tg("⚠️ V7.5 No quotes");return
+    if q.empty:tg("⚠️ V7.6 No quotes");return
     q["symbolToken"]=q["symbolToken"].astype(str);q["ltp"]=pd.to_numeric(q["ltp"],errors="coerce");q["tradeVolume"]=pd.to_numeric(q["tradeVolume"],errors="coerce")
     q=q.dropna(subset=["symbolToken","ltp","tradeVolume"]);q=q[(q.ltp>=MIN_PRICE)&(q.tradeVolume>=MIN_VOL)].sort_values("tradeVolume",ascending=False).head(TOP_UNIVERSE)
     q=q.merge(em[["symbol","token"]].drop_duplicates("token"),left_on="symbolToken",right_on="token",how="left").dropna(subset=["symbol"])
@@ -214,12 +210,12 @@ def main():
         z["score"]=int(min(100,max(0,z["tech_score"]+z["whole_bonus"]+z["nr7_bonus"]+bonus)))
         z["opt_bias"]=opt["bias"];z["opt_bonus"]=bonus;z["opt_ratio"]=float(opt["ratio"]);z["opt_c"]=opt["contracts"];z["mapped"]=opt.get("mapped","")
         final.append(z)
-        print(f'{z["symbol"]} -> {z["mapped"]} {opt["bias"]} {opt["ratio"]:.2f} -> {z["score"]}', flush=True)
+        print(f'{z["symbol"]} -> {z["mapped"]} {opt["bias"]} {opt["ratio"]:.2f}({opt["contracts"]}c) -> {z["score"]}', flush=True)
     for z in res[12:]:
         z["score"]=z["tech_score"]+z["whole_bonus"]+z["nr7_bonus"];z["opt_bias"]="SKIP";z["opt_bonus"]=0;z["opt_ratio"]=0;z["opt_c"]=0;z["mapped"]="";final.append(z)
     final.sort(key=lambda x:x["score"],reverse=True)
     sig=[x for x in final if x["score"]>=MIN_SCORE][:TOP_SIGNALS]
-    msg=[f"⚡ AI INTRADAY V7.5 FINAL | {datetime.now(IST):%d-%b %H:%M IST}",f"NSE:{len(em)} Liquid:{len(q)} Analysed:{stat['ok']} VolLow:{stat['vol_low']} IPO:{stat['ipo_skip']}","","🧠 5m/15m+Whole+NR7+3M Option Auto"]
+    msg=[f"⚡ AI INTRADAY V7.6 FINAL | {datetime.now(IST):%d-%b %H:%M IST}",f"NSE:{len(em)} Liquid:{len(q)} Analysed:{stat['ok']} VolLow:{stat['vol_low']} IPO:{stat['ipo_skip']}","","🧠 5m/15m+Whole+NR7+3M Option Auto"]
     if sig:
         msg+=["","🔥 QUALIFYING SETUPS"]
         for i,z in enumerate(sig,1):
@@ -231,4 +227,4 @@ def main():
 
 if __name__=="__main__":
     try:main()
-    except Exception as e:tg(f"❌ V7.5 ERROR\n{e}");raise
+    except Exception as e:tg(f"❌ V7.6 ERROR\n{e}");raise
