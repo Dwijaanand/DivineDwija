@@ -49,8 +49,8 @@ def candles(s,tok,days,interval):
 
 def is_old_enough(tok,s):
     try:
-        d=candles(s,tok,120,"ONE_DAY")
-        return d is not None and len(d)>=50
+        d=candles(s,tok,250,"ONE_DAY")
+        return d is not None and len(d)>=120
     except:
         return True
 
