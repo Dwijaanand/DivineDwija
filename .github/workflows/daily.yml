@@ -22,6 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
+          pip install -r requirements.txt
           pip install smartapi-python pyotp pandas numpy requests pytz websocket-client logzero
 
       - name: Run python scanner
@@ -33,4 +34,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python swing_chandan.py
+          python scanner.py
