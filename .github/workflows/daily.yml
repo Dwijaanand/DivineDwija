@@ -8,21 +8,23 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install smartapi-python pyotp pandas requests logzero websocket-client pytz
+          pip install smartapi-python pyotp pandas numpy requests pytz websocket-client logzero
 
-      - name: Run python scanner.py
+      - name: Run python scanner
         env:
           API_KEY: ${{ secrets.API_KEY }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
@@ -31,4 +33,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python scanner.py
+          python swing_chandan.py
