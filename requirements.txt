@@ -12,3 +12,4 @@ six
 smartapi-python
 urllib3
 websocket-client
+yfinance 
