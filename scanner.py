@@ -10,7 +10,9 @@ IST=pytz.timezone("Asia/Kolkata")
 
 HISTORY=900;TOP_LIQUID=100;TOP_SECTOR=3;TOP_FUNDAMENTAL=10;MAX_SIGNALS=5
 MIN_PRICE=50;MIN_AVG20=50000;VOL_THRESHOLD=1.8;FUNDAMENTAL_MIN=60
-QUOTE_BATCH=50;QUOTE_DELAY=1.0;CANDLE_DELAY=.35
+QUOTE_BATCH=20
+QUOTE_DELAY=1.5
+CANDLE_DELAY=.35
 
 SECTOR_MAP={
 "IT":"TCS INFY HCLTECH WIPRO TECHM LTIM MPHASIS COFORGE PERSISTENT LTTS OFSS TATAELXSI KPITTECH CYIENT BSOFT",
@@ -66,7 +68,6 @@ def quotes(a,m):
         toks=[x[1]["token"] for x in batch]
         token_to_sym = {info["token"]: sym for sym, info in batch}
         try:
-            # FIXED: signature is getMarketData(mode, exchangeTokens)
             r=a.getMarketData("FULL", {"NSE":toks})
             fetched = ((r or {}).get("data") or {}).get("fetched",[]) or []
             for x in fetched:
@@ -93,7 +94,11 @@ def candles(a,token,days=HISTORY):
     except Exception as e:
         print("Candle:",e);return pd.DataFrame()
 
-def comp(d): return d.iloc[:-1].copy() if len(d)>1 else d.copy()
+def comp(d):
+    if d is None or len(d)==0 or 'close' not in d.columns:
+        return pd.DataFrame()
+    return d.iloc[:-1].copy() if len(d)>1 else d.copy()
+
 def ema(s,n): return s.ewm(span=n,adjust=False).mean()
 def wma(s,n):
     w=np.arange(1,n+1);return s.rolling(n).apply(lambda x:np.dot(x,w)/w.sum(),raw=True)
@@ -105,7 +110,7 @@ def rsi(s,n=14):
 def macd(s):
     m=ema(s,3)-ema(s,21);q=ema(m,9);return m,q,m-q
 def atr(d,n=14):
-    pc=d.close.shift();tr=pd.concat([d.high-d.low,(d.high-pc).abs(),(d.low-pc).abs()],axis=1).max(axis=1)
+    pc=d['close'].shift();tr=pd.concat([d['high']-d['low'],(d['high']-pc).abs(),(d['low']-pc).abs()],axis=1).max(axis=1)
     return tr.rolling(n).mean()
 def wk(d):
     return d.resample("W-FRI").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
@@ -113,9 +118,11 @@ def mo(d):
     return d.resample("ME").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
 
 def index_status(d):
+    if d is None or len(d)<210 or 'close' not in d.columns:
+        return {"status":"UNKNOWN","ret20":0}
     d=comp(d)
     if len(d)<210:return {"status":"UNKNOWN","ret20":0}
-    c=d.close;v=c.iloc[-1];d20=c.rolling(20).mean().iloc[-1];d50=c.rolling(50).mean().iloc[-1];d200=c.rolling(200).mean().iloc[-1]
+    c=d['close'];v=c.iloc[-1];d20=c.rolling(20).mean().iloc[-1];d50=c.rolling(50).mean().iloc[-1];d200=c.rolling(200).mean().iloc[-1]
     rr=(v/c.iloc[-21]-1)*100;rs=rsi(c,14).iloc[-1]
     if v>d20>d50>d200 and rs>55 and rr>3:s="POSITIVE"
     elif v<d20<d50 and rs<45 and rr<-3:s="NEGATIVE"
@@ -123,15 +130,19 @@ def index_status(d):
     return {"status":s,"ret20":rr,"rsi":rs,"dma20":d20,"dma50":d50,"dma200":d200}
 
 def stock_quality(d,q):
-    d=comp(d)
-    if len(d)<220:return None
-    c=d.close.iloc[-1];av=d.volume.rolling(20).mean().iloc[-1];vol=d.volume.iloc[-1]
-    hi=d.high.tail(252).max()
-    if c<MIN_PRICE or av<MIN_AVG20 or vol<av*VOL_THRESHOLD or c<d.close.rolling(200).mean().iloc[-1] or c<hi*.92 or d.close.iloc[-1]<=d.open.iloc[-1]:return None
+    if d is None or len(d)<220: return None
+    d_c=comp(d)
+    if len(d_c)<220: return None
+    c=d_c['close'].iloc[-1];av=d_c['volume'].rolling(20).mean().iloc[-1];vol=d_c['volume'].iloc[-1]
+    hi=d_c['high'].tail(252).max()
+    if c<MIN_PRICE or av<MIN_AVG20 or vol<av*VOL_THRESHOLD or c<d_c['close'].rolling(200).mean().iloc[-1] or c<hi*.92 or d_c['close'].iloc[-1]<=d_c['open'].iloc[-1]:return None
     return {"close":c,"volx":vol/av,"high52":hi,"avg20":av}
 
 def sector_strength(data,nifty):
-    nr=(nifty.close.iloc[-1]/nifty.close.iloc[-21]-1)*100
+    if nifty is None or len(nifty)<25 or 'close' not in nifty.columns:
+        nr=0
+    else:
+        nr=(nifty['close'].iloc[-1]/nifty['close'].iloc[-21]-1)*100
     res=[]
     for sec,stocks in SECTOR_MAP.items():
         xs=[data[s]["df"] for s in stocks if s in data]
@@ -139,9 +150,9 @@ def sector_strength(data,nifty):
         rs=[];above=0
         for d in xs:
             d=comp(d)
-            if len(d)<60:continue
-            rr=(d.close.iloc[-1]/d.close.iloc[-21]-1)*100;rs.append(rr)
-            if d.close.iloc[-1]>d.close.rolling(50).mean().iloc[-1]:above+=1
+            if len(d)<60 or 'close' not in d.columns:continue
+            rr=(d['close'].iloc[-1]/d['close'].iloc[-21]-1)*100;rs.append(rr)
+            if d['close'].iloc[-1]>d['close'].rolling(50).mean().iloc[-1]:above+=1
         if not rs:continue
         avg=float(np.mean(rs));pct=above/len(rs)*100
         label="FRESH" if avg-nr>=2 and pct>=60 else "STRONG" if avg-nr>0 and pct>=50 else "WEAK" if avg-nr<0 and pct<40 else "NEUTRAL"
@@ -151,7 +162,7 @@ def sector_strength(data,nifty):
 def nitin(d):
     w=comp(wk(d))
     if len(w)<60:return None
-    c=w.close;h30=hma(c,30);h44=hma(c,44);m,s,h=macd(c);r=rsi(c,9);rm=r.rolling(3).mean();rw=wma(r,21)
+    c=w['close'];h30=hma(c,30);h44=hma(c,44);m,s,h=macd(c);r=rsi(c,9);rm=r.rolling(3).mean();rw=wma(r,21)
     i=len(w)-1
     if not all(np.isfinite([h30.iloc[i],h44.iloc[i],m.iloc[i],s.iloc[i],r.iloc[i],rm.iloc[i],rw.iloc[i]])):return None
     cross=None
@@ -168,15 +179,16 @@ def nitin(d):
 
 def chart_setup(d):
     d=comp(d)
-    c=d.close
+    if len(d)<60: return {"valid":False}
+    c=d['close']
     e21=ema(c,21);e50=ema(c,50);e200=ema(c,200);a=atr(d,14)
     last=c.iloc[-1];atrv=a.iloc[-1]
-    swing=d.low.tail(10).min()
+    swing=d['low'].tail(10).min()
     support=max(swing,e21.iloc[-1]*.985)
     sl=support-.5*atrv
     if sl>=last: sl=last-1.2*atrv
     risk=last-sl
-    recent_high=d.high.tail(20).max()
+    recent_high=d['high'].tail(20).max()
     breakout=last>=recent_high*.995
     entry_low=max(e21.iloc[-1],support)
     entry_high=min(last, max(entry_low, recent_high*1.002))
@@ -194,7 +206,7 @@ def chart_setup(d):
 def monthly(d):
     x=comp(mo(d))
     if len(x)<35:return None
-    c=x.close;h10=hma(c,10);h30=hma(c,30)
+    c=x['close'];h10=hma(c,10);h30=hma(c,30)
     ok=c.iloc[-1]>h10.iloc[-1]>h30.iloc[-1]
     return {"ok":bool(ok),"h10":h10.iloc[-1],"h30":h30.iloc[-1]}
 
@@ -239,7 +251,13 @@ def stars(score):
     return "★★★★★" if score>=85 else "★★★★☆" if score>=75 else "★★★☆☆" if score>=65 else "★★☆☆☆"
 
 def main():
-    a=login();m=master();q=quotes(a,m)
+    a=login()
+    m=master()
+    universe_syms=set(SYMBOL_SECTOR.keys())
+    universe_syms.update(["NIFTY 50","NIFTY","SENSEX","NIFTY50"])
+    m_filtered={s:m[s] for s in universe_syms if s in m}
+    print(f"Universe filtered: {len(m_filtered)} stocks (not full 2000)")
+    q=quotes(a,m_filtered)
     liquid=[]
     for s,x in q.items():
         try:
@@ -268,7 +286,8 @@ def main():
     if ns["status"]=="NEGATIVE" and ss["status"]=="NEGATIVE":
         print("Both NIFTY and SENSEX negative. BUY scan skipped.")
         return
-    sec=sector_strength(data,comp(nd))
+    nifty_for_sector = comp(nd) if nd is not None and len(nd)>0 else pd.DataFrame()
+    sec=sector_strength(data,nifty_for_sector)
     goodsec=[x for x in sec if x["label"] in ("FRESH","STRONG")][:TOP_SECTOR]
     goodnames={x["sector"] for x in goodsec}
     candidates=[]
@@ -276,16 +295,14 @@ def main():
         secname=SYMBOL_SECTOR.get(s)
         if secname not in goodnames:continue
         n=nitin(x["df"]); moq=monthly(x["df"]); cs=chart_setup(x["df"])
-        if not n or not moq or not moq["ok"] or not cs["valid"]:continue
+        if not n or not moq or not moq["ok"] or not cs.get("valid"):continue
         sector=next(z for z in goodsec if z["sector"]==secname)
         candidates.append({"s":s,"df":x["df"],"n":n,"mo":moq,"cs":cs,"sec":sector})
     def techscore(z):
         n=z["n"];c=z["cs"];sec=z["sec"]
         ss=100 if sec["label"]=="FRESH" else 75
-        rs=min(100,max(0,50+n["rsi"]-50))
-        vol=min(100,z["df"].volume.iloc[-1]/max(1,z["df"].volume.rolling(20).mean().iloc[-1])*25)
-        br=15 if c["breakout"] else 10
-        return.25*ss+.35*rs+.20*min(100,c["rsi"]*1.25)+.10*vol+.10*br
+        vol=min(100,z["df"]['volume'].iloc[-1]/max(1,z["df"]['volume'].rolling(20).mean().iloc[-1])*25)
+        return.25*ss+.35*min(100,n["rsi"]*1.5)+.20*min(100,c["rsi"]*1.25)+.10*vol+.10*(15 if c["breakout"] else 10)
     candidates=sorted(candidates,key=techscore,reverse=True)
     candidates=candidates[:TOP_FUNDAMENTAL]
     for z in candidates:
@@ -297,7 +314,7 @@ def main():
         print("No final BUY setup.")
         return
     now=datetime.now(IST).strftime("%d %b %Y %I:%M %p")
-    msg=f"🔥 DIVINE DWIJA V4.2 — SECTOR SWING\n⏰ {now}\n\n"
+    msg=f"🔥 DIVINE DWIJA V4.2.2 — SECTOR SWING\n⏰ {now}\n\n"
     msg+=f"BRAHMA — MARKET\nNIFTY: {ns['status']} ({ns['ret20']:+.1f}% 20D)\n"
     msg+=f"SENSEX: {ss['status']} ({ss['ret20']:+.1f}% 20D)\n\nVISHNU — TOP SECTORS\n"
     for i,z in enumerate(goodsec,1):
@@ -305,7 +322,7 @@ def main():
     msg+="\nMAHESH — FINAL TECHNICAL BUY SETUPS\n━━━━━━━━━━━━━━━━━━\n"
     for i,z in enumerate(final,1):
         c=z["cs"];n=z["n"];f=z["fund"];d=z["df"];s=z["s"]
-        ltp=float(d.close.iloc[-1]);volx=d.volume.iloc[-1]/max(1,d.volume.rolling(20).mean().iloc[-1])
+        ltp=float(d['close'].iloc[-1]);volx=d['volume'].iloc[-1]/max(1,d['volume'].rolling(20).mean().iloc[-1])
         msg+=f"\n#{i} {s} {stars(z['score'])}\n"
         msg+=f"🏭 Sector: {z['sec']['sector']} | {z['sec']['label']}\n"
         msg+=f"📊 Score: {z['score']:.0f}/100 | Setup: {c['setup']}\n"
