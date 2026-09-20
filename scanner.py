@@ -1,801 +1,324 @@
-import os,time,pytz,requests,pyotp
-import pandas as pd
-from datetime import datetime
+import os,time,requests,pyotp,pandas as pd,numpy as np
+from datetime import datetime,timedelta
 from SmartApi import SmartConnect
+import pytz
 
-# ================= CONFIG =================
-LIQUID_COUNT=100
-MIN_PRICE=20.0
-VOL_MULT=3.0
-MAX_RANGE=18.0
-MIN_HISTORY=220
-API_DELAY=1.05
+API_KEY=os.getenv("API_KEY");CLIENT_ID=os.getenv("CLIENT_ID");PASSWORD=os.getenv("PASSWORD");TOTP_SECRET=os.getenv("TOTP_SECRET")
+TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN");TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
+MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 IST=pytz.timezone("Asia/Kolkata")
 
-API_KEY=os.getenv("API_KEY")
-CLIENT_ID=os.getenv("CLIENT_ID")
-PASSWORD=os.getenv("PASSWORD")
-TOTP_SECRET=os.getenv("TOTP_SECRET")
-BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
+HISTORY=900;TOP_LIQUID=100;TOP_SECTOR=3;TOP_FUNDAMENTAL=10;MAX_SIGNALS=5
+MIN_PRICE=50;MIN_AVG20=50000;VOL_THRESHOLD=1.8;FUNDAMENTAL_MIN=60
+QUOTE_BATCH=50;QUOTE_DELAY=1.0;CANDLE_DELAY=.35
 
-MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+SECTOR_MAP={
+"IT":"TCS INFY HCLTECH WIPRO TECHM LTIM MPHASIS COFORGE PERSISTENT LTTS OFSS TATAELXSI KPITTECH CYIENT BSOFT",
+"PHARMA":"SUNPHARMA DRREDDY CIPLA DIVISLAB AUROPHARMA TORNTPHARM LUPIN ALKEM ZYDUSLIFE GLAND LAURUSLABS MANKIND BIOCON ABBOTINDIA IPCALAB",
+"AUTO":"MARUTI M&M TATAMOTORS EICHERMOT HEROMOTOCO BAJAJ-AUTO TVSMOTOR ASHOKLEY BHARATFORG MOTHERSON BOSCHLTD EXIDEIND SONACOMS UNOMINDA",
+"BANK":"HDFCBANK ICICIBANK SBIN AXISBANK KOTAKBANK INDUSINDBK BANKBARODA PNB CANBK IDFCFIRSTB FEDERALBNK AUBANK BANDHANBNK",
+"FINANCE":"BAJFINANCE BAJAJFINSV SHRIRAMFIN CHOLAFIN MUTHOOTFIN MANAPPURAM LICHSGFIN PFC RECLTD IRFC HUDCO JIOFIN SBICARD",
+"FMCG":"HINDUNILVR ITC NESTLEIND BRITANNIA DABUR MARICO GODREJCP COLPAL TATACONSUM VBL UNITDSPR EMAMILTD RADICO JUBLFOOD",
+"METAL":"TATASTEEL JSWSTEEL HINDALCO JINDALSTEL SAIL NMDC VEDL NATIONALUM APLAPOLLO HINDZINC JSL RATNAMANI",
+"ENERGY":"RELIANCE ONGC NTPC POWERGRID COALINDIA BPCL IOC GAIL ADANIGREEN ADANIPOWER TORNTPOWER TATAPOWER JSWENERGY NHPC ACMESOLAR",
+"INFRA":"LT ADANIENT ADANIPORTS DLF RVNL IRCON NBCC NCC BHEL BEL CONCOR KEC KALPATPOWR ASHOKA",
+"REALTY":"DLF LODHA GODREJPROP OBEROIRLTY PRESTIGE PHOENIXLTD BRIGADE SOBHA RAYMOND",
+"CHEMICAL":"SRF PIDILITIND DEEPAKNTR NAVINFLUOR PIIND ATUL ALKYLAMINE AARTIIND FINEORG CLEAN FLUOROCHEM SOLARINDS",
+"DEFENCE":"HAL BEL BDL MAZDOCK COCHINSHIP GRSE SOLARINDS DATAPATTNS ASTRAMICRO",
+"CAPITAL_GOODS":"SIEMENS ABB CUMMINSIND THERMAX CGPOWER SCHNEIDER KEI POLYCAB HAVELLS VOLTAS",
+"TELECOM":"BHARTIARTL INDUSTOWER IDEA HFCL TANLA",
+"CONSUMER":"TRENT TITAN KALYAN JUBLFOOD DMART NYKAA ABFRL INDIAMART",
+"LOGISTICS":"CONCOR DELHIVERY BLUEDART TCI VRLLOG IRCTC"}
+SECTOR_MAP={k:v.split() for k,v in SECTOR_MAP.items()}
+SYMBOL_SECTOR={}
+for k,v in SECTOR_MAP.items():
+    for s in v: SYMBOL_SECTOR.setdefault(s,k)
 
-# ================= TELEGRAM =================
-def send_telegram(msg):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram credentials missing")
-        return
-    try:
-        url=f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r=requests.post(
-            url,
-            json={
-                "chat_id":CHAT_ID,
-                "text":msg,
-                "parse_mode":"Markdown"
-            },
-            timeout=10
-        )
-        print(f"Telegram: {r.status_code}")
-    except Exception as e:
-        print(f"Telegram err: {e}")
+def tg(x):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:return
+    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",data={"chat_id":TELEGRAM_CHAT_ID,"text":x},timeout=15)
+    except Exception as e: print("Telegram:",e)
 
-# ================= LOGIN =================
 def login():
-    if not all([API_KEY,CLIENT_ID,PASSWORD,TOTP_SECRET]):
-        raise Exception("Angel One credentials missing")
+    if not all([API_KEY,CLIENT_ID,PASSWORD,TOTP_SECRET]): raise RuntimeError("Credentials missing")
+    a=SmartConnect(api_key=API_KEY)
+    r=a.generateSession(CLIENT_ID,PASSWORD,pyotp.TOTP(TOTP_SECRET).now())
+    if not r or not r.get("status"): raise RuntimeError(f"Login failed: {r}")
+    return a
 
-    totp=pyotp.TOTP(TOTP_SECRET).now()
-    obj=SmartConnect(api_key=API_KEY)
-    session=obj.generateSession(CLIENT_ID,PASSWORD,totp)
+def master():
+    r=requests.get(MASTER_URL,timeout=30);r.raise_for_status(); rows=r.json();out={}
+    for x in rows:
+        seg=str(x.get("exch_seg","")).upper()
+        if seg not in ("NSE_CM","NSE"): continue
+        sym=str(x.get("symbol","")).upper();tok=str(x.get("token",""))
+        if not sym or not tok: continue
+        base=sym.replace("-EQ","")
+        out.setdefault(base,{"token":tok,"symbol":sym})
+    if len(out)<100: raise RuntimeError(f"NSE master too small: {len(out)}")
+    return out
 
-    if not session or not session.get("data"):
-        raise Exception(f"Login failed: {session}")
-
-    print("Login: SUCCESS")
-    return obj
-
-# ================= CANDLE RETRY =================
-def get_candles(obj,params):
-    for i in range(5):
+def quotes(a,m):
+    out={}
+    items=list(m.items())
+    for i in range(0,len(items),QUOTE_BATCH):
+        toks=[x[1]["token"] for x in items[i:i+QUOTE_BATCH]]
         try:
-            r=obj.getCandleData(params)
-
-            if r and r.get("data"):
-                return r["data"]
-
-            print(f"Candle retry {i+1}: {r}")
-
-        except Exception as e:
-            print(f"Candle retry {i+1}: {e}")
-
-        time.sleep(1+i*0.7)
-
-    return None
-
-# ================= DATAFRAME =================
-def make_df(candles):
-    if not candles:
-        return None
-
-    df=pd.DataFrame(
-        candles,
-        columns=[
-            "time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]
-    )
-
-    df["time"]=pd.to_datetime(
-        df["time"],
-        errors="coerce"
-    )
-
-    for c in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
-    ]:
-        df[c]=pd.to_numeric(
-            df[c],
-            errors="coerce"
-        )
-
-    df=df.dropna()
-    df=df.sort_values("time")
-    df=df.reset_index(drop=True)
-
-    return df
-
-# ================= BULK MARKET DATA =================
-def get_bulk_market_data(obj,nse):
-
-    print(
-        "Fetching actual NSE liquidity "
-        "using bulk market data..."
-    )
-
-    result=[]
-
-    rows=nse[
-        ["symbol","token"]
-    ].copy()
-
-    rows["token"]=rows["token"].astype(str)
-
-    tokens=rows["token"].tolist()
-
-    # Angel One bulk market data:
-    # maximum 50 tokens per request
-    for start in range(
-        0,
-        len(tokens),
-        50
-    ):
-
-        batch=tokens[
-            start:start+50
-        ]
-
-        batch_set=set(batch)
-
-        print(
-            f"Market data batch "
-            f"{start+1}-"
-            f"{min(start+50,len(tokens))} / "
-            f"{len(tokens)}"
-        )
-
-        try:
-
-            data=obj.getMarketData(
-                "FULL",
-                {
-                    "NSE":batch
-                }
-            )
-
-            if data and data.get("data"):
-
-                fetched=data[
-                    "data"
-                ].get(
-                    "fetched",
-                    []
-                )
-
-                for x in fetched:
-
-                    tok=str(
-                        x.get(
-                            "symbolToken",
-                            x.get(
-                                "symboltoken",
-                                ""
-                            )
-                        )
-                    )
-
-                    if tok not in batch_set:
-                        continue
-
-                    volume=x.get(
-                        "tradeVolume",
-                        0
-                    )
-
-                    try:
-                        volume=float(
-                            volume or 0
-                        )
-                    except:
-                        volume=0
-
-                    ltp=x.get(
-                        "ltp",
-                        0
-                    )
-
-                    try:
-                        ltp=float(
-                            ltp or 0
-                        )
-                    except:
-                        ltp=0
-
-                    result.append({
-                        "token":tok,
-                        "volume":volume,
-                        "ltp":ltp
-                    })
-
-            else:
-                print(
-                    f"Market data error: "
-                    f"{data}"
-                )
-
-        except Exception as e:
-            print(
-                f"Market data exception: "
-                f"{e}"
-            )
-
-        if start+50<len(tokens):
-            time.sleep(API_DELAY)
-
-    if not result:
-        return pd.DataFrame()
-
-    vol=pd.DataFrame(result)
-
-    vol=vol.drop_duplicates(
-        "token"
-    )
-
-    merged=nse.merge(
-        vol,
-        on="token",
-        how="inner"
-    )
-
-    merged=merged[
-        (merged["ltp"]>=MIN_PRICE) &
-        (merged["volume"]>0)
-    ]
-
-    merged=merged.sort_values(
-        "volume",
-        ascending=False
-    )
-
-    merged=merged.head(
-        LIQUID_COUNT
-    )
-
-    return merged.reset_index(
-        drop=True
-    )
-
-# ================= WEEKLY CONFIRMATION =================
-def weekly_confirmation(df):
-
-    x=df.copy()
-
-    x=x.set_index("time")
-
-    weekly=x.resample(
-        "W-FRI"
-    ).agg({
-        "open":"first",
-        "high":"max",
-        "low":"min",
-        "close":"last",
-        "volume":"sum"
-    }).dropna()
-
-    if len(weekly)<30:
-        return False
-
-    weekly["ema10"]=weekly[
-        "close"
-    ].ewm(
-        span=10,
-        adjust=False
-    ).mean()
-
-    weekly["ema30"]=weekly[
-        "close"
-    ].ewm(
-        span=30,
-        adjust=False
-    ).mean()
-
-    w=weekly.iloc[-1]
-    p=weekly.iloc[-2]
-
-    return bool(
-        w["close"]>w["ema10"] and
-        w["ema10"]>w["ema30"] and
-        w["ema10"]>p["ema10"] and
-        w["close"]>p["close"]
-    )
-
-# ================= STOCK SCANNER =================
-def scan_stock(obj,sym,tok):
-
-    params={
-        "exchange":"NSE",
-        "symboltoken":str(tok),
-        "interval":"ONE_DAY",
-        "fromdate":"2021-03-01 09:15",
-        "todate":datetime.now(
-            IST
-        ).strftime(
-            "%Y-%m-%d 15:30"
-        )
-    }
-
-    candles=get_candles(
-        obj,
-        params
-    )
-
-    if not candles:
-        return None
-
-    df=make_df(candles)
-
-    if df is None:
-        return None
-
-    if len(df)<MIN_HISTORY:
-        return None
-
-    # ================= COMPLETED CANDLE =================
-    now=datetime.now(IST)
-
-    if (
-        len(df)>0 and
-        df["time"].iloc[-1].date()==now.date()
-    ):
-        df=df.iloc[:-1].copy()
-
-    if len(df)<MIN_HISTORY:
-        return None
-
-    close=float(
-        df["close"].iloc[-1]
-    )
-
-    # ================= PRICE =================
-    if close<MIN_PRICE:
-        return None
-
-    # ================= 200 DMA =================
-    df["dma200"]=df[
-        "close"
-    ].rolling(200).mean()
-
-    dma200=float(
-        df["dma200"].iloc[-1]
-    )
-
-    if pd.isna(dma200):
-        return None
-
-    if close<=dma200:
-        return None
-
-    # ================= ATH BREAK =================
-    previous_ath=float(
-        df["high"].iloc[:-1].max()
-    )
-
-    candle=df.iloc[-1]
-
-    high=float(candle["high"])
-    low=float(candle["low"])
-    op=float(candle["open"])
-
-    # Today's high must break previous ATH
-    if high<previous_ath:
-        return None
-
-    # Close must remain near ATH
-    if close<previous_ath*0.995:
-        return None
-
-    # ================= VOLUME =================
-    avg20=float(
-        df["volume"].iloc[-21:-1].mean()
-    )
-
-    today_vol=float(
-        candle["volume"]
-    )
-
-    if avg20<=0:
-        return None
-
-    vol_x=today_vol/avg20
-
-    if vol_x<VOL_MULT:
-        return None
-
-    # ================= TIGHT RANGE =================
-    last20=df.tail(20)
-
-    range_high=float(
-        last20["high"].max()
-    )
-
-    range_low=float(
-        last20["low"].min()
-    )
-
-    if range_low<=0:
-        return None
-
-    range_pct=(
-        (range_high-range_low)/
-        range_low
-    )*100
-
-    if range_pct>MAX_RANGE:
-        return None
-
-    # ================= CANDLE STRENGTH =================
-    candle_range=high-low
-
-    if candle_range<=0:
-        return None
-
-    # Green breakout candle
-    if close<=op:
-        return None
-
-    close_position=(
-        (close-low)/
-        candle_range
-    )
-
-    # Close in upper 35%
-    if close_position<0.65:
-        return None
-
-    # ================= WEEKLY =================
-    if not weekly_confirmation(df):
-        return None
-
-    # ================= SCORE =================
-    score=30
-
-    # Volume score
-    if vol_x>=5:
-        score+=25
-    elif vol_x>=4:
-        score+=22
-    elif vol_x>=3:
-        score+=18
-
-    # 200 DMA distance
-    dma_distance=(
-        close/dma200-1
-    )*100
-
-    if dma_distance>=20:
-        score+=15
-    elif dma_distance>=10:
-        score+=12
-    elif dma_distance>=5:
-        score+=9
-    else:
-        score+=6
-
-    # Tight range
-    if range_pct<=8:
-        score+=15
-    elif range_pct<=12:
-        score+=12
-    elif range_pct<=15:
-        score+=9
-    else:
-        score+=6
-
-    # Candle strength
-    if close_position>=0.85:
-        score+=10
-    elif close_position>=0.75:
-        score+=8
-    else:
-        score+=5
-
-    # Weekly confirmation
-    score+=5
-
-    # ================= ATR =================
-    prev_close=df[
-        "close"
-    ].shift(1)
-
-    tr=pd.concat([
-        df["high"]-df["low"],
-        (
-            df["high"]-
-            prev_close
-        ).abs(),
-        (
-            df["low"]-
-            prev_close
-        ).abs()
-    ],axis=1).max(axis=1)
-
-    atr=float(
-        tr.rolling(14).mean().iloc[-1]
-    )
-
-    if pd.isna(atr) or atr<=0:
-        atr=close*0.03
-
-    # ================= SL =================
-    swing_low=float(
-        df["low"].tail(10).min()
-    )
-
-    sl=max(
-        swing_low-0.5*atr,
-        close*0.85
-    )
-
-    risk=close-sl
-
-    if risk<=0:
-        return None
-
-    # ================= TARGETS =================
-    t1=close+2*risk
-    t2=close+3*risk
-
-    # ================= STARS =================
-    if score>=90:
-        stars="★★★★★"
-    elif score>=82:
-        stars="★★★★☆"
-    elif score>=74:
-        stars="★★★☆☆"
-    elif score>=66:
-        stars="★★☆☆☆"
-    else:
-        stars="★☆☆☆☆"
-
-    return {
-        "symbol":sym.replace(
-            "-EQ",
-            ""
-        ),
-        "close":close,
-        "ath":previous_ath,
-        "vol_x":vol_x,
-        "range_pct":range_pct,
-        "dma200":dma200,
-        "score":score,
-        "stars":stars,
-        "sl":sl,
-        "t1":t1,
-        "t2":t2
-    }
-
-# ================= MAIN =================
-def main():
-
-    obj=None
-
+            r=a.getMarketData({"mode":"FULL","exchangeTokens":{"NSE":toks}})
+            for x in ((r or {}).get("data") or {}).get("fetched",[]) or []:
+                s=str(x.get("tradingsymbol") or x.get("symbol") or "").upper().replace("-EQ","")
+                if s: out[s]=x
+        except Exception as e: print("Quote batch:",e)
+        time.sleep(QUOTE_DELAY)
+    return out
+
+def candles(a,token,days=HISTORY):
     try:
-
-        # ================= LOGIN =================
-        obj=login()
-
-        # ================= NSE MASTER =================
-        print(
-            "Fetching NSE master..."
-        )
-
-        master=pd.read_json(
-            MASTER_URL
-        )
-
-        nse=master[
-            (master["exch_seg"]=="NSE") &
-            (
-                master["symbol"]
-                .astype(str)
-                .str.endswith("-EQ")
-            )
-        ].copy()
-
-        nse["token"]=nse[
-            "token"
-        ].astype(str)
-
-        nse=nse.drop_duplicates(
-            "token"
-        )
-
-        print(
-            f"NSE Stocks: {len(nse)}"
-        )
-
-        # ================= REAL LIQUIDITY =================
-        liquid=get_bulk_market_data(
-            obj,
-            nse
-        )
-
-        if liquid.empty:
-            raise Exception(
-                "Could not fetch bulk NSE market data"
-            )
-
-        print(
-            f"Actual liquid stocks selected: "
-            f"{len(liquid)}"
-        )
-
-        print(
-            "\nTop liquid stocks:"
-        )
-
-        for i,(_,r) in enumerate(
-            liquid.head(20).iterrows(),
-            1
-        ):
-
-            print(
-                f"{i}. {r['symbol']} "
-                f"Volume={int(r['volume']):,}"
-            )
-
-        # ================= ATH SCAN =================
-        found=[]
-
-        for i,(_,row) in enumerate(
-            liquid.iterrows(),
-            1
-        ):
-
-            sym=row["symbol"]
-            tok=row["token"]
-
-            print(
-                f"Scanning "
-                f"{i}/{len(liquid)} "
-                f"{sym}..."
-            )
-
-            try:
-
-                result=scan_stock(
-                    obj,
-                    sym,
-                    tok
-                )
-
-                if result:
-
-                    found.append(
-                        result
-                    )
-
-                    print(
-                        f"FOUND {sym} | "
-                        f"Score="
-                        f"{result['score']} | "
-                        f"Vol="
-                        f"{result['vol_x']:.2f}x"
-                    )
-
-            except Exception as e:
-
-                print(
-                    f"{sym} error: {e}"
-                )
-
-            time.sleep(
-                API_DELAY
-            )
-
-        # ================= RANK =================
-        found=sorted(
-            found,
-            key=lambda x:(
-                x["score"],
-                x["vol_x"],
-                -x["range_pct"]
-            ),
-            reverse=True
-        )
-
-        # ================= TELEGRAM =================
-        now=datetime.now(
-            IST
-        ).strftime(
-            "%d %b %Y %H:%M"
-        )
-
-        msg=(
-            f"*DIVINE DWIJA ATH BREAKOUT*\n"
-            f"⏰ {now}\n\n"
-            f"NSE Stocks: {len(nse)}\n"
-            f"Actual Liquid Top: "
-            f"{len(liquid)}\n"
-            f"BUY Setups: {len(found)}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-        )
-
-        if found:
-
-            for i,r in enumerate(
-                found[:10],
-                1
-            ):
-
-                msg+=(
-                    f"\n*#{i} "
-                    f"{r['symbol']} "
-                    f"{r['stars']}*\n"
-                    f"💰 LTP: "
-                    f"₹{r['close']:.2f}\n"
-                    f"📊 Score: "
-                    f"{r['score']}/100\n"
-                    f"🔥 Volume: "
-                    f"{r['vol_x']:.2f}x\n"
-                    f"🚀 ATH: "
-                    f"₹{r['ath']:.2f}\n"
-                    f"📈 200DMA: "
-                    f"₹{r['dma200']:.2f}\n"
-                    f"📦 20D Range: "
-                    f"{r['range_pct']:.1f}%\n"
-                    f"🛡 SL: "
-                    f"₹{r['sl']:.2f}\n"
-                    f"🎯 T1: "
-                    f"₹{r['t1']:.2f}\n"
-                    f"🎯 T2: "
-                    f"₹{r['t2']:.2f}\n"
-                )
-
-        else:
-
-            msg+=(
-                "\nNo setup today.\n\n"
-                "_Core: ATH Break + 3x Volume + "
-                "200 DMA + Weekly Uptrend + "
-                "Tight Range_"
-            )
-
-        print(
-            "\n"+msg
-        )
-
-        send_telegram(
-            msg
-        )
-
+        end=datetime.now(IST);start=end-timedelta(days=days)
+        r=a.getCandleData({"exchange":"NSE","symboltoken":str(token),"interval":"ONE_DAY",
+            "fromdate":start.strftime("%Y-%m-%d %H:%M"),"todate":end.strftime("%Y-%m-%d %H:%M")})
+        z=(r or {}).get("data") or []
+        if not z:return pd.DataFrame()
+        d=pd.DataFrame(z,columns=["date","open","high","low","close","volume"])
+        for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
+        d["date"]=pd.to_datetime(d["date"])
+        return d.dropna().sort_values("date").drop_duplicates("date").set_index("date")
     except Exception as e:
+        print("Candle:",e);return pd.DataFrame()
 
-        print(
-            f"MAIN ERROR: {e}"
-        )
+def comp(d): return d.iloc[:-1].copy() if len(d)>1 else d.copy()
+def ema(s,n): return s.ewm(span=n,adjust=False).mean()
+def wma(s,n):
+    w=np.arange(1,n+1);return s.rolling(n).apply(lambda x:np.dot(x,w)/w.sum(),raw=True)
+def hma(s,n): return wma(2*wma(s,n//2)-wma(s,n),max(1,int(np.sqrt(n))))
+def rsi(s,n=14):
+    d=s.diff();u=d.clip(lower=0);v=-d.clip(upper=0)
+    au=u.ewm(alpha=1/n,adjust=False).mean();av=v.ewm(alpha=1/n,adjust=False).mean()
+    return 100-100/(1+au/av.replace(0,np.nan))
+def macd(s):
+    m=ema(s,3)-ema(s,21);q=ema(m,9);return m,q,m-q
+def atr(d,n=14):
+    pc=d.close.shift();tr=pd.concat([d.high-d.low,(d.high-pc).abs(),(d.low-pc).abs()],axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+def wk(d):
+    return d.resample("W-FRI").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+def mo(d):
+    return d.resample("ME").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
 
-        send_telegram(
-            "*DIVINE DWIJA ATH BREAKOUT ERROR*\n\n"
-            f"`{str(e)[:500]}`"
-        )
+def index_status(d):
+    d=comp(d)
+    if len(d)<210:return {"status":"UNKNOWN","ret20":0}
+    c=d.close;v=c.iloc[-1];d20=c.rolling(20).mean().iloc[-1];d50=c.rolling(50).mean().iloc[-1];d200=c.rolling(200).mean().iloc[-1]
+    rr=(v/c.iloc[-21]-1)*100;rs=rsi(c,14).iloc[-1]
+    if v>d20>d50>d200 and rs>55 and rr>3:s="POSITIVE"
+    elif v<d20<d50 and rs<45 and rr<-3:s="NEGATIVE"
+    else:s="SIDEWAYS"
+    return {"status":s,"ret20":rr,"rsi":rs,"dma20":d20,"dma50":d50,"dma200":d200}
 
-    finally:
+def stock_quality(d,q):
+    d=comp(d)
+    if len(d)<220:return None
+    c=d.close.iloc[-1];av=d.volume.rolling(20).mean().iloc[-1];vol=d.volume.iloc[-1]
+    hi=d.high.tail(252).max()
+    if c<MIN_PRICE or av<MIN_AVG20 or vol<av*VOL_THRESHOLD or c<d.close.rolling(200).mean().iloc[-1] or c<hi*.92 or d.close.iloc[-1]<=d.open.iloc[-1]:return None
+    return {"close":c,"volx":vol/av,"high52":hi,"avg20":av}
 
-        if obj:
+def sector_strength(data,nifty):
+    nr=(nifty.close.iloc[-1]/nifty.close.iloc[-21]-1)*100
+    res=[]
+    for sec,stocks in SECTOR_MAP.items():
+        xs=[data[s]["df"] for s in stocks if s in data]
+        if not xs:continue
+        rs=[];above=0
+        for d in xs:
+            d=comp(d)
+            if len(d)<60:continue
+            rr=(d.close.iloc[-1]/d.close.iloc[-21]-1)*100;rs.append(rr)
+            if d.close.iloc[-1]>d.close.rolling(50).mean().iloc[-1]:above+=1
+        if not rs:continue
+        avg=float(np.mean(rs));pct=above/len(rs)*100
+        label="FRESH" if avg-nr>=2 and pct>=60 else "STRONG" if avg-nr>0 and pct>=50 else "WEAK" if avg-nr<0 and pct<40 else "NEUTRAL"
+        res.append({"sector":sec,"rs":avg-nr,"pct":pct,"label":label,"count":len(rs)})
+    return sorted(res,key=lambda x:(x["label"] in ("FRESH","STRONG"),x["rs"],x["pct"]),reverse=True)
 
-            try:
+def nitin(d):
+    w=comp(wk(d))
+    if len(w)<60:return None
+    c=w.close;h30=hma(c,30);h44=hma(c,44);m,s,h=macd(c);r=rsi(c,9);rm=r.rolling(3).mean();rw=wma(r,21)
+    i=len(w)-1
+    if not all(np.isfinite([h30.iloc[i],h44.iloc[i],m.iloc[i],s.iloc[i],r.iloc[i],rm.iloc[i],rw.iloc[i]])):return None
+    # Recent HMA30 reclaim, not necessarily same candle as MACD confirmation.
+    cross=None
+    for j in range(max(1,i-8),i+1):
+        if c.iloc[j-1]<=h30.iloc[j-1] and c.iloc[j]>h30.iloc[j]:cross=j
+    if cross is None:return None
+    macdcross=None
+    for j in range(max(1,i-6),i+1):
+        if m.iloc[j-1]<=s.iloc[j-1] and m.iloc[j]>s.iloc[j]:macdcross=j
+    if macdcross is None:return None
+    neg=int((h.iloc[max(0,macdcross-14):macdcross]<0).sum())
+    if neg<8 or c.iloc[i]<=h30.iloc[i] or h30.iloc[i]<h44.iloc[i] or r.iloc[i]<=50 or r.iloc[i]<=rm.iloc[i]:return None
+    return {"h30":h30.iloc[i],"h44":h44.iloc[i],"rsi":r.iloc[i],"macdh":h.iloc[i],"neg":neg,"cross":i-cross,"macdcross":i-macdcross}
 
-                obj.terminateSession(
-                    CLIENT_ID
-                )
+def chart_setup(d):
+    d=comp(d)
+    c=d.close
+    e21=ema(c,21);e50=ema(c,50);e200=ema(c,200);a=atr(d,14)
+    last=c.iloc[-1];atrv=a.iloc[-1]
+    swing=d.low.tail(10).min()
+    # Technical support cluster: recent swing low and EMA21.
+    support=max(swing,e21.iloc[-1]*.985)
+    sl=support-.5*atrv
+    if sl>=last: sl=last-1.2*atrv
+    risk=last-sl
+    recent_high=d.high.tail(20).max()
+    breakout=last>=recent_high*.995
+    entry_low=max(e21.iloc[-1],support)
+    entry_high=min(last, max(entry_low, recent_high*1.002))
+    if entry_low>entry_high:entry_low=last*.985;entry_high=last
+    # If price is extended far above setup zone, require pullback/retest.
+    extended=last>entry_high*1.025
+    t1=last+2*risk;t2=last+3*risk
+    rr1=(t1-last)/risk if risk>0 else 0;rr2=(t2-last)/risk if risk>0 else 0
+    daily_rsi=rsi(c,14).iloc[-1]
+    setup="BREAKOUT" if breakout else "PULLBACK/RECLAIM"
+    valid=(last>e21.iloc[-1] and e21.iloc[-1]>e50.iloc[-1] and e50.iloc[-1]>e200.iloc[-1] and not extended)
+    return {"entry_low":entry_low,"entry_high":entry_high,"sl":sl,"t1":t1,"t2":t2,
+            "support":support,"rsi":daily_rsi,"ema21":e21.iloc[-1],"ema50":e50.iloc[-1],
+            "ema200":e200.iloc[-1],"atr":atrv,"breakout":breakout,"extended":extended,
+            "setup":setup,"valid":valid}
 
-                print(
-                    "Session terminated"
-                )
+def monthly(d):
+    x=comp(mo(d))
+    if len(x)<35:return None
+    c=x.close;h10=hma(c,10);h30=hma(c,30)
+    ok=c.iloc[-1]>h10.iloc[-1]>h30.iloc[-1]
+    return {"ok":bool(ok),"h10":h10.iloc[-1],"h30":h30.iloc[-1]}
 
-            except:
-                pass
+def fundamentals(sym):
+    try:
+        import yfinance as yf
+        t=yf.Ticker(sym+".NS")
+        inc=t.quarterly_income_stmt;cf=t.quarterly_cashflow;bs=t.balance_sheet
+        if inc is None or inc.empty:return {"score":0,"text":"No quarterly data"}
+        cols=list(inc.columns)
+        def val(df,key,col):
+            try:return float(df.loc[key,col])
+            except:return np.nan
+        rev=next((x for x in ["Total Revenue","Operating Revenue"] if x in inc.index),None)
+        prof=next((x for x in ["Net Income","Net Income Common Stockholders"] if x in inc.index),None)
+        opcf=next((x for x in ["Operating Cash Flow","Total Cash From Operating Activities"] if x in cf.index),None) if cf is not None and not cf.empty else None
+        score=0;notes=[]
+        if rev and len(cols)>=2:
+            a=val(inc,rev,cols[0]);b=val(inc,rev,cols[1])
+            if np.isfinite(a) and np.isfinite(b) and a>b:score+=20;notes.append("Revenue QoQ+")
+        if prof and len(cols)>=2:
+            a=val(inc,prof,cols[0]);b=val(inc,prof,cols[1])
+            if np.isfinite(a) and np.isfinite(b) and a>b:score+=20;notes.append("Profit QoQ+")
+        if prof and rev:
+            p=val(inc,prof,cols[0]);r=val(inc,rev,cols[0])
+            if np.isfinite(p) and np.isfinite(r) and r>0 and p>0:score+=15;notes.append("Profit positive")
+        if opcf:
+            v=val(cf,opcf,cf.columns[0])
+            if np.isfinite(v) and v>0:score+=25;notes.append("OCF positive")
+        if bs is not None and not bs.empty:
+            debt=0
+            for k in ["Total Debt","Long Term Debt","Current Debt"]:
+                if k in bs.index:
+                    z=val(bs,k,bs.columns[0])
+                    if np.isfinite(z):debt+=z
+            if debt<=0:score+=20;notes.append("Low/zero debt")
+            else:score+=10;notes.append("Debt present")
+        return {"score":min(100,score),"text":", ".join(notes) or "Mixed"}
+    except Exception as e:return {"score":0,"text":"Fundamental unavailable"}
 
+def stars(score):
+    return "★★★★★" if score>=85 else "★★★★☆" if score>=75 else "★★★☆☆" if score>=65 else "★★☆☆☆"
+
+def main():
+    a=login();m=master();q=quotes(a,m)
+    liquid=[]
+    for s,x in q.items():
+        try:
+            l=float(x.get("ltp") or 0);v=float(x.get("tradeVolume") or x.get("volume") or 0)
+            if l>0 and v>0:liquid.append((s,l*v,l))
+        except:pass
+    liquid=sorted(liquid,key=lambda x:x[1],reverse=True)[:TOP_LIQUID]
+    print("Actual Liquid Top:",len(liquid))
+    data={}
+    for s,turn,l in liquid:
+        d=candles(a,m[s]["token"])
+        if len(d)>=220:
+            data[s]={"df":d,"quality":stock_quality(d,q.get(s,{}))}
+        time.sleep(CANDLE_DELAY)
+    data={s:x for s,x in data.items() if x["quality"]}
+    nt=find_nifty=None
+    for n in ["NIFTY","NIFTY 50","NIFTY50"]:
+        if n in m: nt=n;break
+    if not nt: raise RuntimeError("NIFTY token not found")
+    nd=candles(a,m[nt]["token"])
+    ns=index_status(nd)
+    # Sensex may not exist in NSE master. Try common Angel master names.
+    st=None
+    for n in ["SENSEX","BSE SENSEX"]:
+        if n in m:st=n;break
+    ss=index_status(candles(a,m[st]["token"])) if st else {"status":"UNAVAILABLE","ret20":0}
+    if ns["status"]=="NEGATIVE" and ss["status"]=="NEGATIVE":
+        print("Both NIFTY and SENSEX negative. BUY scan skipped.")
+        return
+    sec=sector_strength(data,comp(nd))
+    goodsec=[x for x in sec if x["label"] in ("FRESH","STRONG")][:TOP_SECTOR]
+    goodnames={x["sector"] for x in goodsec}
+    candidates=[]
+    for s,x in data.items():
+        secname=SYMBOL_SECTOR.get(s)
+        if secname not in goodnames:continue
+        n=nitin(x["df"]); moq=monthly(x["df"]); cs=chart_setup(x["df"])
+        if not n or not moq or not moq["ok"] or not cs["valid"]:continue
+        sector=next(z for z in goodsec if z["sector"]==secname)
+        candidates.append({"s":s,"df":x["df"],"n":n,"mo":moq,"cs":cs,"sec":sector})
+    # Technical ranking first. Fundamental is deliberately called only for last 10.
+    def techscore(z):
+        n=z["n"];c=z["cs"];sec=z["sec"]
+        ss=100 if sec["label"]=="FRESH" else 75
+        rs=min(100,max(0,50+n["rsi"]-50))
+        vol=min(100,z["df"].volume.iloc[-1]/max(1,z["df"].volume.rolling(20).mean().iloc[-1])*25)
+        br=15 if c["breakout"] else 10
+        return .25*ss+.35*rs+.20*min(100,c["rsi"]*1.25)+.10*vol+.10*br
+    candidates=sorted(candidates,key=techscore,reverse=True)
+    candidates=candidates[:TOP_FUNDAMENTAL]
+    for z in candidates:
+        z["fund"]=fundamentals(z["s"])
+        z["score"]=.20*(100 if z["sec"]["label"]=="FRESH" else 75)+.30*min(100,z["n"]["rsi"]*1.5)+.20*min(100,z["cs"]["rsi"]*1.25)+.30*z["fund"]["score"]
+    candidates=sorted(candidates,key=lambda z:z["score"],reverse=True)
+    final=candidates[:MAX_SIGNALS]
+    if not final:
+        print("No final BUY setup.")
+        return
+    now=datetime.now(IST).strftime("%d %b %Y %I:%M %p")
+    msg=f"🔥 DIVINE DWIJA V4.2 — SECTOR SWING\n⏰ {now}\n\n"
+    msg+=f"BRAHMA — MARKET\nNIFTY: {ns['status']} ({ns['ret20']:+.1f}% 20D)\n"
+    msg+=f"SENSEX: {ss['status']} ({ss['ret20']:+.1f}% 20D)\n\nVISHNU — TOP SECTORS\n"
+    for i,z in enumerate(goodsec,1):
+        msg+=f"{i}. {z['sector']} — {z['label']} | RS {z['rs']:+.1f}% | {z['pct']:.0f}% >50DMA\n"
+    msg+="\nMAHESH — FINAL TECHNICAL BUY SETUPS\n━━━━━━━━━━━━━━━━━━\n"
+    for i,z in enumerate(final,1):
+        c=z["cs"];n=z["n"];f=z["fund"];d=z["df"];s=z["s"]
+        ltp=float(d.close.iloc[-1]);volx=d.volume.iloc[-1]/max(1,d.volume.rolling(20).mean().iloc[-1])
+        msg+=f"\n#{i} {s} {stars(z['score'])}\n"
+        msg+=f"🏭 Sector: {z['sec']['sector']} | {z['sec']['label']}\n"
+        msg+=f"📊 Score: {z['score']:.0f}/100 | Setup: {c['setup']}\n"
+        msg+=f"💰 LTP: ₹{ltp:.2f}\n🎯 BUY ZONE: ₹{c['entry_low']:.2f}–₹{c['entry_high']:.2f}\n"
+        msg+=f"🛑 SL: ₹{c['sl']:.2f}\n🎯 T1: ₹{c['t1']:.2f} | T2: ₹{c['t2']:.2f}\n"
+        msg+=f"📐 R:R: 1:{(c['t1']-ltp)/max(.01,ltp-c['sl']):.1f} / 1:{(c['t2']-ltp)/max(.01,ltp-c['sl']):.1f}\n"
+        msg+=f"📌 Support: ₹{c['support']:.2f} | Invalid below: ₹{c['sl']:.2f}\n"
+        msg+=f"📈 Daily RSI: {c['rsi']:.1f} | Weekly RSI9: {n['rsi']:.1f}\n"
+        msg+=f"Weekly HMA30/44: ₹{n['h30']:.2f}/₹{n['h44']:.2f}\n"
+        msg+=f"MACD: bullish | <0 bars: {n['neg']} | Volume: {volx:.2f}x\n"
+        msg+=f"Monthly: PASS | Fundamental: {f['score']}/100\n"
+        msg+=f"🧾 {f['text']}\n"
+        msg+="━━━━━━━━━━━━━━━━━━\n"
+    tg(msg);print(msg)
 
 if __name__=="__main__":
     main()
