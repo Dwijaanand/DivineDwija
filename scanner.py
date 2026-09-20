@@ -105,8 +105,7 @@ def index_status(d):
     return {"status":st,"ret20":rr,"rsi":rs}
 
 def sector_strength(data,nifty):
-    n=comp(nifty)
-    nr=(n.close.iloc[-1]/n.close.iloc[-21]-1)*100 if len(n)>=25 else 0
+    n=comp(nifty);nr=(n.close.iloc[-1]/n.close.iloc[-21]-1)*100 if len(n)>=25 else 0
     res=[]
     for sec,stocks in SECTOR_MAP.items():
         xs=[data[s]["df"] for s in stocks if s in data];rs=[];above=0
@@ -125,8 +124,8 @@ def quality(d):
     d=comp(d)
     if len(d)<220:return None
     c=d.close.iloc[-1];av=d.volume.rolling(20).mean().iloc[-1];v=d.volume.iloc[-1];hi=d.high.tail(252).max()
-    if c<MIN_PRICE or av<MIN_AVG20 or v<av*VOL_THRESHOLD or c<d.close.rolling(200).mean().iloc[-1] or c<hi*.92 or d.close.iloc[-1]<=d.open.iloc[-1]:return None
-    return {"volx":v/av,"high52":hi,"avg20":av}
+    if c<MIN_PRICE or av<MIN_AVG20 or v<av*VOL_THRESHOLD or c<d.close.rolling(200).mean().iloc[-1] or d.close.iloc[-1]<=d.open.iloc[-1]:return None
+    return {"volx":v/av,"high52":hi,"avg20":av,"high52_pct":c/hi*100}
 
 def monthly(d):
     x=comp(mo(d))
@@ -193,30 +192,20 @@ def no_setup(reason=""):
 
 def main():
     a=login();m=master()
-
-    # Market mood is informational only. It MUST NOT block sector scanning when unavailable.
     nifty=next((x for x in ["NIFTY","NIFTY 50","NIFTY50"] if x in m),None)
     sensex=next((x for x in ["SENSEX","BSE SENSEX"] if x in m),None)
     if not nifty:
-        no_setup("NIFTY data unavailable")
-        return
+        no_setup("NIFTY data unavailable");return
 
-    nd=candles(a,m[nifty]["token"])
-    ns=index_status(nd)
+    nd=candles(a,m[nifty]["token"]);ns=index_status(nd)
     sd=candles(a,m[sensex]["token"]) if sensex else pd.DataFrame()
     ss=index_status(sd) if sensex else {"status":"UNAVAILABLE","ret20":0,"rsi":50}
     print("MARKET:",ns["status"],ss["status"])
-
-    # Only skip when both indices have confirmed negative completed-candle trend.
-    # UNKNOWN/UNAVAILABLE is allowed to continue.
     if ns["status"]=="NEGATIVE" and ss["status"]=="NEGATIVE":
-        no_setup("NIFTY and SENSEX both negative")
-        return
+        no_setup("NIFTY and SENSEX both negative");return
 
-    sector_symbols=set(SYMBOL_SECTOR)
-    sector_master={s:m[s] for s in sector_symbols if s in m}
+    sector_symbols=set(SYMBOL_SECTOR);sector_master={s:m[s] for s in sector_symbols if s in m}
     print("Sector universe:",len(sector_master))
-
     sector_data={}
     for s,info in sector_master.items():
         d=candles(a,info["token"])
@@ -225,14 +214,10 @@ def main():
 
     sec=sector_strength(sector_data,comp(nd))
     goodsec=[x for x in sec if x["label"] in ("FRESH","STRONG")][:TOP_SECTOR]
-
     if not goodsec:
-        no_setup("No strong sector found")
-        return
+        no_setup("No strong sector found");return
 
-    goodnames={x["sector"] for x in goodsec}
-    print("TOP SECTORS:",goodnames)
-
+    goodnames={x["sector"] for x in goodsec};print("TOP SECTORS:",goodnames)
     selected={s:x for s,x in sector_data.items() if SYMBOL_SECTOR.get(s) in goodnames}
     print("Stocks in top sectors:",len(selected))
 
@@ -251,46 +236,57 @@ def main():
         d=x["df"];w=weekly(d);moq=monthly(d);di=daily(d)
         if not w or not w["ok"] or not moq or not moq["ok"] or not di["valid"]:continue
         sector=next(z for z in goodsec if z["sector"]==SYMBOL_SECTOR[s])
-        candidates.append({"s":s,"df":d,"w":w,"mo":moq,"di":di,"sec":sector})
+        q=quality(d)
+        candidates.append({"s":s,"df":d,"w":w,"mo":moq,"di":di,"sec":sector,"q":q})
 
     if not candidates:
-        no_setup("No stock passed Monthly + Weekly + Daily setup")
-        return
+        no_setup("No stock passed Monthly + Weekly + Daily setup");return
 
-    candidates=sorted(candidates,key=lambda z:
-        .25*(100 if z["sec"]["label"]=="FRESH" else 75)+
-        .25*min(100,z["w"]["rsi"]*1.5)+
-        .25*min(100,z["di"]["rsi"]*1.25)+
-        .15*min(100,(z["df"].volume.iloc[-1]/max(1,z["df"].volume.rolling(20).mean().iloc[-1]))*25)+
-        .10*(15 if z["di"]["breakout"] else 10),reverse=True)[:TOP_FUNDAMENTAL]
+    # Pre-rank top 10: technical quality + sector + 52W momentum + volume.
+    def pre_score(z):
+        q=z["q"];p52=min(100,q["high52_pct"])
+        return (.25*(100 if z["sec"]["label"]=="FRESH" else 75)+
+                .25*min(100,z["w"]["rsi"]*1.5)+
+                .20*min(100,z["di"]["rsi"]*1.25)+
+                .15*p52+
+                .15*min(100,(z["df"].volume.iloc[-1]/max(1,z["df"].volume.rolling(20).mean().iloc[-1]))*25))
+    candidates=sorted(candidates,key=pre_score,reverse=True)[:TOP_FUNDAMENTAL]
 
     for z in candidates:
         z["fund"]=fundamentals(z["s"])
-        z["score"]=.20*(100 if z["sec"]["label"]=="FRESH" else 75)+.20*min(100,z["w"]["rsi"]*1.5)+.20*min(100,z["di"]["rsi"]*1.25)+.40*z["fund"]["score"]
+        q=z["q"];p52=min(100,q["high52_pct"])
+        # Fundamental reduced to 10%; technical/momentum quality gets the remaining 90%.
+        z["score"]=.20*(100 if z["sec"]["label"]=="FRESH" else 75)+\
+                   .20*min(100,z["mo"]["close"]/max(.01,z["mo"]["h30"])*100-100+50)+\
+                   .20*min(100,z["w"]["rsi"]*1.5)+\
+                   .20*min(100,z["di"]["rsi"]*1.25)+\
+                   .10*p52+\
+                   .10*z["fund"]["score"]
 
     final=sorted(candidates,key=lambda z:z["score"],reverse=True)[:MAX_SIGNALS]
     if not final:
-        no_setup("No final BUY setup")
-        return
+        no_setup("No final BUY setup");return
 
     now=datetime.now(IST).strftime("%d %b %Y %I:%M %p")
-    msg=f"🔥 DIVINE DWIJA V4.3 — SECTOR-FIRST SWING\n⏰ {now}\n\n"
+    msg=f"🔥 DIVINE DWIJA V4.4 — SECTOR-FIRST QUALITY SWING\n⏰ {now}\n\n"
     msg+=f"🧠 MARKET MOOD\nNIFTY: {ns['status']} ({ns['ret20']:+.1f}% 20D)\nSENSEX: {ss['status']} ({ss['ret20']:+.1f}% 20D)\n\n"
     msg+="🔥 TOP SECTORS\n"
     for i,z in enumerate(goodsec,1):msg+=f"{i}. {z['sector']} — {z['label']} | RS {z['rs']:+.1f}% | {z['pct']:.0f}% >50DMA\n"
-    msg+="\n🏆 TOP 3 SWING SETUPS\n━━━━━━━━━━━━━━━━━━\n"
+    msg+="\n🏆 TOP 3 QUALITY SWING SETUPS\n━━━━━━━━━━━━━━━━━━\n"
     for i,z in enumerate(final,1):
-        d=z["df"];di=z["di"];w=z["w"];moq=z["mo"];f=z["fund"]
+        d=z["df"];di=z["di"];w=z["w"];moq=z["mo"];f=z["fund"];q=z["q"]
         volx=d.volume.iloc[-1]/max(1,d.volume.rolling(20).mean().iloc[-1])
         msg+=f"\n#{i} {z['s']} {stars(z['score'])}\n🏭 Sector: {z['sec']['sector']} | {z['sec']['label']}\n📊 Score: {z['score']:.0f}/100 | Setup: {di['setup']}\n"
+        msg+=f"📈 52W Position: {q['high52_pct']:.1f}% of High ₹{q['high52']:.2f}\n"
         msg+=f"\n📅 MONTHLY\nTrend: {moq['trend']} | HMA10 ₹{moq['h10']:.2f} > HMA30 ₹{moq['h30']:.2f}\n"
         msg+=f"📅 WEEKLY\nTrend: BULLISH | RSI9 {w['rsi']:.1f} | HMA30/44 ₹{w['h30']:.2f}/₹{w['h44']:.2f} | MACD Bullish\n"
         msg+=f"📅 DAILY\nEMA21/50/200 ₹{di['ema21']:.2f}/₹{di['ema50']:.2f}/₹{di['ema200']:.2f} | RSI14 {di['rsi']:.1f}\n"
-        msg+=f"Volume: {volx:.2f}x | 52W High: ₹{di['high52']:.2f}\n\n🎯 TRADE PLAN\nBUY ZONE: ₹{di['entry_low']:.2f}–₹{di['entry_high']:.2f}\n"
+        msg+=f"Volume: {volx:.2f}x\n\n🎯 TRADE PLAN\nBUY ZONE: ₹{di['entry_low']:.2f}–₹{di['entry_high']:.2f}\n"
         msg+=f"ENTRY: ₹{di['entry_high']:.2f}\n🛑 SL: ₹{di['sl']:.2f}\n🎯 T1: ₹{di['t1']:.2f} | T2: ₹{di['t2']:.2f}\n"
         msg+=f"📐 R:R: 1:{(di['t1']-di['entry_high'])/max(.01,di['entry_high']-di['sl']):.1f} / 1:{(di['t2']-di['entry_high'])/max(.01,di['entry_high']-di['sl']):.1f}\n"
         msg+=f"📌 Support: ₹{di['support']:.2f} | Invalid below: ₹{di['sl']:.2f}\n"
-        msg+=f"Fundamental: {f['score']}/100 | {f['text']}\n━━━━━━━━━━━━━━━━━━\n"
+        msg+=f"Fundamental: {f['score']}/100 (10% weight) | {f['text']}\n━━━━━━━━━━━━━━━━━━\n"
     tg(msg);print(msg)
 
 if __name__=="__main__":main()
+        
