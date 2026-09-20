@@ -2,7 +2,7 @@ name: Dwija Run
 
 on:
   schedule:
-    - cron: '0 12 * * 1-5'  # 5:30 PM IST
+    - cron: '50 3 * * 1-5'  # 9:20 AM IST (Mon-Fri)
   workflow_dispatch:
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install smartapi-python pyotp pandas numpy requests pytz websocket-client logzero
+          pip install smartapi-python pyotp pandas numpy requests pytz websocket-client logzero yfinance
 
       - name: Run python scanner
         env:
