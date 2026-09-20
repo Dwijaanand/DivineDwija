@@ -62,13 +62,20 @@ def quotes(a,m):
     out={}
     items=list(m.items())
     for i in range(0,len(items),QUOTE_BATCH):
-        toks=[x[1]["token"] for x in items[i:i+QUOTE_BATCH]]
+        batch = items[i:i+QUOTE_BATCH]
+        toks=[x[1]["token"] for x in batch]
+        token_to_sym = {info["token"]: sym for sym, info in batch}
         try:
-            r=a.getMarketData({"mode":"FULL","exchangeTokens":{"NSE":toks}})
-            for x in ((r or {}).get("data") or {}).get("fetched",[]) or []:
-                s=str(x.get("tradingsymbol") or x.get("symbol") or "").upper().replace("-EQ","")
-                if s: out[s]=x
-        except Exception as e: print("Quote batch:",e)
+            # FIXED: signature is getMarketData(mode, exchangeTokens)
+            r=a.getMarketData("FULL", {"NSE":toks})
+            fetched = ((r or {}).get("data") or {}).get("fetched",[]) or []
+            for x in fetched:
+                tok = str(x.get("symbolToken") or "")
+                sym = token_to_sym.get(tok)
+                if sym:
+                    out[sym]=x
+        except Exception as e:
+            print("Quote batch:",e)
         time.sleep(QUOTE_DELAY)
     return out
 
@@ -147,7 +154,6 @@ def nitin(d):
     c=w.close;h30=hma(c,30);h44=hma(c,44);m,s,h=macd(c);r=rsi(c,9);rm=r.rolling(3).mean();rw=wma(r,21)
     i=len(w)-1
     if not all(np.isfinite([h30.iloc[i],h44.iloc[i],m.iloc[i],s.iloc[i],r.iloc[i],rm.iloc[i],rw.iloc[i]])):return None
-    # Recent HMA30 reclaim, not necessarily same candle as MACD confirmation.
     cross=None
     for j in range(max(1,i-8),i+1):
         if c.iloc[j-1]<=h30.iloc[j-1] and c.iloc[j]>h30.iloc[j]:cross=j
@@ -166,7 +172,6 @@ def chart_setup(d):
     e21=ema(c,21);e50=ema(c,50);e200=ema(c,200);a=atr(d,14)
     last=c.iloc[-1];atrv=a.iloc[-1]
     swing=d.low.tail(10).min()
-    # Technical support cluster: recent swing low and EMA21.
     support=max(swing,e21.iloc[-1]*.985)
     sl=support-.5*atrv
     if sl>=last: sl=last-1.2*atrv
@@ -176,10 +181,8 @@ def chart_setup(d):
     entry_low=max(e21.iloc[-1],support)
     entry_high=min(last, max(entry_low, recent_high*1.002))
     if entry_low>entry_high:entry_low=last*.985;entry_high=last
-    # If price is extended far above setup zone, require pullback/retest.
     extended=last>entry_high*1.025
     t1=last+2*risk;t2=last+3*risk
-    rr1=(t1-last)/risk if risk>0 else 0;rr2=(t2-last)/risk if risk>0 else 0
     daily_rsi=rsi(c,14).iloc[-1]
     setup="BREAKOUT" if breakout else "PULLBACK/RECLAIM"
     valid=(last>e21.iloc[-1] and e21.iloc[-1]>e50.iloc[-1] and e50.iloc[-1]>e200.iloc[-1] and not extended)
@@ -252,13 +255,12 @@ def main():
             data[s]={"df":d,"quality":stock_quality(d,q.get(s,{}))}
         time.sleep(CANDLE_DELAY)
     data={s:x for s,x in data.items() if x["quality"]}
-    nt=find_nifty=None
+    nt=None
     for n in ["NIFTY","NIFTY 50","NIFTY50"]:
         if n in m: nt=n;break
     if not nt: raise RuntimeError("NIFTY token not found")
     nd=candles(a,m[nt]["token"])
     ns=index_status(nd)
-    # Sensex may not exist in NSE master. Try common Angel master names.
     st=None
     for n in ["SENSEX","BSE SENSEX"]:
         if n in m:st=n;break
@@ -277,14 +279,13 @@ def main():
         if not n or not moq or not moq["ok"] or not cs["valid"]:continue
         sector=next(z for z in goodsec if z["sector"]==secname)
         candidates.append({"s":s,"df":x["df"],"n":n,"mo":moq,"cs":cs,"sec":sector})
-    # Technical ranking first. Fundamental is deliberately called only for last 10.
     def techscore(z):
         n=z["n"];c=z["cs"];sec=z["sec"]
         ss=100 if sec["label"]=="FRESH" else 75
         rs=min(100,max(0,50+n["rsi"]-50))
         vol=min(100,z["df"].volume.iloc[-1]/max(1,z["df"].volume.rolling(20).mean().iloc[-1])*25)
         br=15 if c["breakout"] else 10
-        return .25*ss+.35*rs+.20*min(100,c["rsi"]*1.25)+.10*vol+.10*br
+        return.25*ss+.35*rs+.20*min(100,c["rsi"]*1.25)+.10*vol+.10*br
     candidates=sorted(candidates,key=techscore,reverse=True)
     candidates=candidates[:TOP_FUNDAMENTAL]
     for z in candidates:
