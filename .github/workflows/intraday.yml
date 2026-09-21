@@ -3,7 +3,9 @@ name: AI Intraday Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 4 * * 1-5"   # 9:40 AM IST - Single daily scan
+    - cron: "45 3 * * 1-5"   # 9:15 AM IST
+    - cron: "30 4 * * 1-5"   # 10:00 AM IST
+    - cron: "30 5 * * 1-5"   # 11:00 AM IST
 
 jobs:
   scan:
