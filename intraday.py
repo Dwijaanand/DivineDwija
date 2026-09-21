@@ -13,6 +13,9 @@ OPTION_MAX=6;OPTION_DAYS=5;OPTION_STRIKES=2;OPTION_DELAY=.2
 IST=pytz.timezone("Asia/Kolkata");OPTION_CACHE={}
 UNDERLYING_FIX={"MOTHERSON":"MOTHERSUMI","M_M":"M&M","M&M":"M&M","BAJAJ-AUTO":"BAJAJAUTO","BAJAJ_AUTO":"BAJAJAUTO"}
 
+# IPO / New listing block list
+IPO_BLOCK = {"GLASSWALL","SAMBHV","PINELABS","TATATECH","IREDA","MAMA","DOMS","KRN","BLS","BAJAJHFL"}
+
 def tg(x):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",data={"chat_id":TELEGRAM_CHAT_ID,"text":x},timeout=12)
@@ -90,7 +93,7 @@ def feat(x):
     return x
 
 def market_bias(s,em):
-    idx={"NIFTY":"99926000","SENSEX":"99919000"} # Sensex may not be in NSE quote list
+    idx={"NIFTY":"99926000","SENSEX":"99919000"}
     vals=[]
     for name,tok,ex in [("NIFTY","99926000","NSE"),("SENSEX","99919000","BSE")]:
         d=candles(s,tok,10,"FIFTEEN_MINUTE",ex)
@@ -104,7 +107,6 @@ def market_bias(s,em):
     return ("BULLISH" if z>0 else "BEARISH" if z<0 else "NEUTRAL"),z
 
 def sector_name(sym):
-    # Angel master does not reliably expose sector; use conservative liquid-sector buckets.
     b=sym.replace("-EQ","").upper()
     groups={
       "BANKING":set("HDFCBANK ICICIBANK SBIN AXISBANK KOTAKBANK INDUSINDBK BANKBARODA PNB FEDERALBNK CANBK".split()),
@@ -125,6 +127,16 @@ def sector_strength(res):
     return {k:float(np.mean(v)) for k,v in d.items()}
 
 def analyze(sym,tok,s,mbias):
+    # IPO name block
+    clean = sym.replace("-EQ","").upper()
+    if clean in IPO_BLOCK:
+        return None
+
+    # IPO history filter - at least 120 daily candles required
+    d_daily = candles(s,tok,250,"ONE_DAY","NSE")
+    if d_daily is None or len(d_daily) < 120:
+        return None
+
     d5=candles(s,tok,12,"FIVE_MINUTE");time.sleep(DELAY);d15=candles(s,tok,25,"FIFTEEN_MINUTE")
     if d5 is None or d15 is None or len(d5)<60 or len(d15)<60:return None
     d5=feat(d5);d15=feat(d15);a=d5.iloc[-2];b=d15.iloc[-2]
@@ -143,6 +155,10 @@ def analyze(sym,tok,s,mbias):
     sell=sum([25 if bear15 else 0,20 if bear5 else 0,15 if below_vwap else 0,15 if 25<=a.rsi<=45 else 0,15 if vol>=1.5 else 0,10 if breakout_sell else 0])
     direction="BUY" if buy>sell else "SELL";tech=max(buy,sell)
     if tech<60 or vol<MIN_VOLX:return None
+    # Skip OTHER sector low quality to avoid random smallcaps
+    sec = sector_name(sym)
+    if sec == "OTHER" and tech < 85:
+        return None
     if mbias=="BULLISH" and direction=="SELL":market_pts=-8
     elif mbias=="BEARISH" and direction=="BUY":market_pts=-8
     elif mbias=="NEUTRAL":market_pts=0
@@ -159,7 +175,7 @@ def analyze(sym,tok,s,mbias):
     t2=entry+(2*risk if direction=="BUY" else -2*risk)
     t3=entry+(3*risk if direction=="BUY" else -3*risk)
     setup="BREAKOUT" if (breakout_buy if direction=="BUY" else breakout_sell) else ("PULLBACK/VWAP" if (above_vwap if direction=="BUY" else below_vwap) else "TREND")
-    return {"symbol":sym,"direction":direction,"tech":tech,"market_pts":market_pts,"entry":entry,"sl":sl,"t1":t1,"t2":t2,"t3":t3,"rsi":float(a.rsi),"volx":vol,"setup":setup,"sector":sector_name(sym),"live_ltp":entry}
+    return {"symbol":sym,"direction":direction,"tech":tech,"market_pts":market_pts,"entry":entry,"sl":sl,"t1":t1,"t2":t2,"t3":t3,"rsi":float(a.rsi),"volx":vol,"setup":setup,"sector":sec,"live_ltp":entry}
 
 def option_flow(s,om,z,us):
     sym=z["symbol"].replace("-EQ","").upper();spot=z["live_ltp"];u=best_underlying(sym,us)
@@ -207,9 +223,7 @@ def main():
     for _,r in q.iterrows():
         z=analyze(r.symbol,r.symbolToken,s,mbias)
         if z:
-            # Always use the fresh quote LTP as the signal price.
             z["live_ltp"]=float(r.ltp)
-            # Recalculate displayed risk/targets around the actual live LTP.
             old_entry=z["entry"];delta=z["live_ltp"]-old_entry
             z["entry"]=z["live_ltp"]
             z["sl"]+=delta;z["t1"]+=delta;z["t2"]+=delta;z["t3"]+=delta
