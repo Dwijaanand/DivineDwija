@@ -14,24 +14,24 @@ TOP_STOCKS_PER_SECTOR=12;TOP_SECTORS=3;TOP_SIGNALS=3;MIN_SCORE=70;MIN_FUND=10
 DAILY_DAYS=520;WEEKLY_DAYS=1800;MONTHLY_DAYS=3500
 FUND_DELAY=.25;QUOTE_BATCH=50;QUOTE_DELAY=1.02
 IST=pytz.timezone("Asia/Kolkata")
-EXCLUDED={"LTIM","TATAMOTORS"}
+EXCLUDED={"LTIM"}
 
 SECTOR_MAP={
 "BANKING":set("HDFCBANK ICICIBANK SBIN AXISBANK KOTAKBANK INDUSINDBK BANKBARODA PNB FEDERALBNK CANBK IDFCFIRSTB RBLBANK BANDHANBNK AUBANK".split()),
-"IT":set("TCS INFY HCLTECH WIPRO TECHM PERSISTENT COFORGE MPHASIS LTTS KPIT CYIENT OFSS".split()),
-"AUTO":set("MARUTI M&M BAJAJ-AUTO BAJAJAUTO EICHERMOT HEROMOTOCO TVSMOTOR ASHOKLEY BOSCH BHARATFORG EXIDEIND MOTHERSON MOTHERSUMI".split()),
+"IT":set("TCS INFY HCLTECH WIPRO TECHM PERSISTENT COFORGE MPHASIS LTTS KPIT CYIENT OFSS LTIM".split()),
+"AUTO":set("MARUTI M&M BAJAJ-AUTO BAJAJAUTO EICHERMOT HEROMOTOCO TVSMOTOR ASHOKLEY BOSCH BHARATFORG EXIDEIND MOTHERSON MOTHERSUMI TATAMOTORS".split()),
 "PHARMA":set("SUNPHARMA DRREDDY CIPLA DIVISLAB AUROPHARMA LUPIN ZYDUSLIFE ALKEM TORRENTPHARM GLAND APOLLOHOSP MAXHEALTH".split()),
 "METALS":set("TATASTEEL JSWSTEEL HINDALCO SAIL JINDALSTEL NMDC VEDL HINDZINC NATIONALUM MOIL".split()),
 "ENERGY":set("RELIANCE ONGC NTPC POWERGRID COALINDIA ADANIGREEN ADANIPOWER TATAPOWER BPCL IOC GAIL PETRONET".split()),
 "FMCG":set("HINDUNILVR ITC NESTLEIND BRITANNIA DABUR MARICO GODREJCP COLPAL TATACONSUM VBL".split()),
-"FINANCE":set("BAJFINANCE BAJAJFINSV SHRIRAMFIN CHOLAFIN MUTHOOTFIN MANAPPURAM PFC RECLTD IRFC LICHSGFIN".split()),
+"FINANCE":set("BAJFINANCE BAJAJFINSV SHRIRAMFIN CHOLAFIN MUTHOOTFIN MANAPPURAM PFC RECLTD IRFC LICHSGFIN BAJAJHFL BLS SAMMAANCAP".split()),
 "REALTY":set("DLF GODREJPROP OBEROIRLTY PRESTIGE PHOENIX SOBHA BRIGADE".split()),
 "INFRA":set("LT LARSEN RVNL IRCON NBCC NCC KEC HCC APLAPOLLO".split()),
 "CAPITAL_GOODS":set("SIEMENS ABB BHEL BEL HAL CGPOWER THERMAX CUMMINSIND SCHNEIDER ELX".split()),
 "CHEMICALS":set("PIDILITIND SRF DEEPAKNTR NAVINFLUOR ATUL CLEAN AARTIIND PIIND TATACHEM UPL".split()),
 "TELECOM":set("BHARTIARTL IDEA INDUSTOWER".split()),
 "MEDIA":set("ZEEL SUNTV PVRINOX NETWORK18".split()),
-"CONSUMER":set("TITAN TRENT KALYANKJIL PAGEIND JUBLFOOD DMART".split()),
+"CONSUMER":set("TITAN TRENT KALYANKJIL PAGEIND JUBLFOOD DMART NYKAA ZOMATO ETERNAL".split()),
 "POWER":set("TATAPOWER TORNTPOWER CESC JSWENERGY NHPC SJVN".split()),
 }
 
@@ -39,15 +39,19 @@ def tg(x):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",data={"chat_id":TELEGRAM_CHAT_ID,"text":x},timeout=12)
         except:pass
+
 def login():
     s=SmartConnect(api_key=API_KEY)
     r=s.generateSession(CLIENT_ID,PASSWORD,pyotp.TOTP(TOTP_SECRET).now())
     if not r or not r.get("status"):raise RuntimeError("Angel login failed")
     return s
+
 def master():
     x=pd.DataFrame(requests.get(MASTER_URL,timeout=30).json())
     x["token"]=x["token"].astype(str);x["symbol"]=x["symbol"].astype(str);return x
+
 def equity_master(m):return m[(m["exch_seg"]=="NSE")&m["symbol"].str.endswith("-EQ")].copy()
+
 def quotes(s,tokens):
     out=[]
     for i in range(0,len(tokens),QUOTE_BATCH):
@@ -56,6 +60,7 @@ def quotes(s,tokens):
         except:pass
         time.sleep(QUOTE_DELAY)
     return pd.DataFrame(out)
+
 def candles(s,tok,days,interval,exchange="NSE"):
     try:
         e=datetime.now();b=e-timedelta(days=days)
@@ -67,9 +72,11 @@ def candles(s,tok,days,interval,exchange="NSE"):
         for c in ["open","high","low","close","volume"]:x[c]=pd.to_numeric(x[c],errors="coerce")
         return x.dropna(subset=["timestamp","close"]).sort_values("timestamp").reset_index(drop=True)
     except:return None
+
 def rsi(s,n=14):
     d=s.diff();u=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean();v=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
     return 100-100/(1+u/v.replace(0,np.nan))
+
 def indicators(x):
     x=x.copy()
     for n in [10,20,30,50,100,200]:x[f"ema{n}"]=x.close.ewm(span=n,adjust=False).mean()
@@ -79,6 +86,7 @@ def indicators(x):
     x["volx"]=x.volume/x.vavg20.replace(0,np.nan);x["volemx"]=x.volume/x.vema20.replace(0,np.nan)
     x["prev20h"]=x.high.shift(1).rolling(20).max();x["prev20l"]=x.low.shift(1).rolling(20).min()
     return x
+
 def completed(x):return None if x is None or len(x)<3 else x.iloc[-2]
 def clean_symbol(sym):return str(sym).replace("-EQ","").upper().strip()
 def sector_name(sym):
@@ -96,6 +104,7 @@ def num(v):
         if z in ("","-","--","None","nan"):return np.nan
         return float(z)
     except:return np.nan
+
 def fund_score(f):
     if not f:return 0
     score=0
@@ -110,6 +119,7 @@ def fund_score(f):
     if ok(f.get("qsales")):score+=5 if f["qsales"]>0 else 0
     if ok(f.get("pledge")):score+=5 if f["pledge"]<1 else 2 if f["pledge"]<5 else 0
     return min(100,score)
+
 def fundamental(sym):
     try:
         b=clean_symbol(sym);url=f"https://www.screener.in/company/{screener_symbol(b)}/"
@@ -127,6 +137,7 @@ def fundamental(sym):
         if not vals["available"]:return None
         vals["fund_score"]=fund_score(vals);vals["source"]="Screener";return vals
     except:return None
+
 def market_mood(s):
     vals=[]
     for name,tok,ex in [("NIFTY","99926000","NSE"),("SENSEX","99919000","BSE")]:
@@ -140,12 +151,9 @@ def market_mood(s):
 
 def is_junk(sym):
     b=clean_symbol(sym)
-    # Only real ETF/Index products - no stock names
     if b.endswith("BEES"):return True
     if b.endswith("ETF"):return True
-    # TOP10/TOP50 type ETFs
-    if b.startswith("NIFTY") and ("BEES" in b or "ETF" in b):return True
-    if b in ("MASPTOP50","MOM50","MOM100","ALPHA","ALPHA50","LOWVOL","QUALITY30"):return True
+    if b in ("MASPTOP50","MOM50","MOM100","ALPHA50","LOWVOL","QUALITY30","GOLDBEES","SILVERBEES","LIQUIDBEES"):return True
     return False
 
 def sector_scan(s,q):
@@ -169,9 +177,6 @@ def sector_scan(s,q):
     ss=df.groupby("sector").agg(avg_tech=("tech","mean"),breadth=("tech",lambda x:float((x>=60).mean()*100)),count=("tech","size")).reset_index()
     ss["score"]=ss.avg_tech*0.65+ss.breadth*0.35
     known=ss[ss.sector!="OTHER"].sort_values("score",ascending=False).head(TOP_SECTORS)
-    if len(known)<TOP_SECTORS:
-        other=ss[ss.sector=="OTHER"].sort_values("score",ascending=False)
-        known=pd.concat([known,other.head(TOP_SECTORS-len(known))])
     return known.sort_values("score",ascending=False).to_dict("records"),df.to_dict("records"),daily_cache
 
 def multi_tf_setup(s,tok,live,mbias,sector_score,f,daily_cache):
@@ -204,7 +209,7 @@ def multi_tf_setup(s,tok,live,mbias,sector_score,f,daily_cache):
 def stars(s):return "★★★★★" if s>=90 else "★★★★☆" if s>=80 else "★★★☆☆" if s>=70 else "★★☆☆☆"
 
 def main():
-    print(f"=== DIVINE SECTOR SWING V5.4 | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
+    print(f"=== DIVINE SECTOR SWING V5.5 | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
     s=login();m=master();em=equity_master(m)
     mbias,mval=market_mood(s);print(f"MARKET MOOD: {mbias} | score {mval}",flush=True)
     q=quotes(s,em.token.tolist())
@@ -217,28 +222,32 @@ def main():
     print(f"HIGH-VOLUME UNIVERSE: {len(q)}",flush=True)
     sectors,universe,daily_cache=sector_scan(s,q)
     if not sectors:
-        out=f"⚡ DIVINE SECTOR SWING V5.4\n{datetime.now(IST):%d-%b %H:%M IST}\nMarket: {mbias}\n\n⚠️ No strong sector found.";print(out);tg(out);return
+        out=f"⚡ DIVINE SECTOR SWING V5.5\n{datetime.now(IST):%d-%b %H:%M IST}\nMarket: {mbias}\n\n⚠️ No strong sector found.";print(out);tg(out);return
     print("SECTORS:",", ".join(f'{z["sector"]} {z["score"]:.1f}' for z in sectors),flush=True)
     secset={z["sector"]:z["score"] for z in sectors}
     candidates=[z for z in universe if z["sector"] in secset]
+    other_pool=[z for z in universe if z["sector"]=="OTHER"]
     bysec={}
     for z in candidates:bysec.setdefault(z["sector"],[]).append(z)
     final_candidates=[]
     for sec,lst in bysec.items():final_candidates+=sorted(lst,key=lambda z:z["tech"],reverse=True)[:TOP_STOCKS_PER_SECTOR]
-    print(f"TOP STOCKS: {len(final_candidates)} | 180D DUAL FILTER: ON | ETF FILTER: ON | IPO AUTO AGE",flush=True)
+    if len(final_candidates) < 36:
+        need=36-len(final_candidates)
+        final_candidates+=sorted(other_pool,key=lambda z:z["tech"],reverse=True)[:need]
+    print(f"TOP STOCKS: {len(final_candidates)} | 180D DUAL: ON | ETF: ON | IPO: AUTO-AGE",flush=True)
     results=[]
     for n,z in enumerate(final_candidates,1):
-        print(f"[{n}/{len(final_candidates)}] {z['symbol']} | {z['sector']} | {z['history']}D / {z['candle_count']}c",flush=True)
+        print(f"[{n}/{len(final_candidates)}] {z['symbol']} | {z['sector']} | {z['history']}D/{z['candle_count']}c",flush=True)
         f=fundamental(z["symbol"]);time.sleep(FUND_DELAY)
         if f is None:f={"fund_score":15,"roce":"NA","roe":"NA","de":"NA","sales5":"NA","profit5":"NA","eps5":"NA","qsales":"NA","qprofit":"NA","source":"NA"}
         if f.get("source")!="NA" and f.get("fund_score",0)<MIN_FUND:continue
-        setup=multi_tf_setup(s,z["token"],z["ltp"],mbias,secset[z["sector"]],f,daily_cache)
+        setup=multi_tf_setup(s,z["token"],z["ltp"],mbias,secset.get(z["sector"],60),f,daily_cache)
         if setup:
-            setup.update({"symbol":z["symbol"],"sector":z["sector"],"live_ltp":z["ltp"],"sector_score":secset[z["sector"]],"fund_data":f,"history":z["history"]})
+            setup.update({"symbol":z["symbol"],"sector":z["sector"],"live_ltp":z["ltp"],"sector_score":secset.get(z["sector"],60),"fund_data":f,"history":z["history"]})
             results.append(setup)
     results.sort(key=lambda x:(x["score"],x["daily"],x["weekly"],x["monthly"],x["volx"]),reverse=True)
     sig=results[:TOP_SIGNALS]
-    msg=[f"🔥 DIVINE SECTOR SWING V5.4 | {datetime.now(IST):%d-%b %H:%M IST}",f"Market Mood: {mbias} ({mval:+d})","Sector Ranking: "+" | ".join(f'{i+1}. {z["sector"]} {z["score"]:.1f}' for i,z in enumerate(sectors)),f"180D DUAL: Candles>=180 & Calendar>=180 | ETF: ON | IPO: AUTO AGE | Analysed: {len(final_candidates)}","🟢 Entry = LIVE Angel LTP",""]
+    msg=[f"🔥 DIVINE SECTOR SWING V5.5 | {datetime.now(IST):%d-%b %H:%M IST}",f"Market Mood: {mbias} ({mval:+d})","Sector Ranking: "+" | ".join(f'{i+1}. {z["sector"]} {z["score"]:.1f}' for i,z in enumerate(sectors)),f"180D DUAL: Candles>=180 & Calendar>=180 | ETF: ON | IPO: AUTO-AGE | Analysed: {len(final_candidates)}","🟢 Entry = LIVE Angel LTP",""]
     if sig:
         msg.append("🏆 TOP 3 SWING SETUPS")
         for i,z in enumerate(sig,1):
@@ -255,10 +264,10 @@ def main():
             msg.append(txt)
     else:
         msg.append("⚠️ NO QUALIFYING SWING SETUP")
-        msg.append(f"Dual 180D passed: {len(final_candidates)} | Bearish alignment failed")
+        msg.append(f"Dual 180D passed: {len(final_candidates)} | Bearish alignment - safety ON")
     out="\n".join(msg);print(out,flush=True);tg(out)
 
 if __name__=="__main__":
     try:main()
     except Exception as e:
-        print("ERROR:",e,flush=True);tg(f"❌ SECTOR SWING V5.4 ERROR\n{e}");raise
+        print("ERROR:",e,flush=True);tg(f"❌ SECTOR SWING V5.5 ERROR\n{e}");raise
