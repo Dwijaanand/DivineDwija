@@ -138,34 +138,50 @@ def market_mood(s):
         vals.append(1 if bull else -1 if bear else 0)
     z=sum(vals);return ("BULLISH" if z>0 else "BEARISH" if z<0 else "NEUTRAL"),z
 
+def is_junk(sym):
+    b=clean_symbol(sym)
+    # Only real ETF/Index products - no stock names
+    if b.endswith("BEES"):return True
+    if b.endswith("ETF"):return True
+    # TOP10/TOP50 type ETFs
+    if b.startswith("NIFTY") and ("BEES" in b or "ETF" in b):return True
+    if b in ("MASPTOP50","MOM50","MOM100","ALPHA","ALPHA50","LOWVOL","QUALITY30"):return True
+    return False
+
 def sector_scan(s,q):
-    rows={};daily_cache={}
-    rows_list=[]
+    rows_list=[];daily_cache={}
     for _,r in q.iterrows():
         sym=r["symbol"];b=clean_symbol(sym)
-        if b in EXCLUDED:continue
-        d=candles(s,r["token"],520,"ONE_DAY")
-        if d is None or len(d)<MIN_HISTORY:continue
+        if b in EXCLUDED or is_junk(sym):continue
+        d=candles(s,r["token"],DAILY_DAYS,"ONE_DAY")
+        if d is None or len(d) < MIN_HISTORY:continue
+        try:
+            cal_days=(d.timestamp.iloc[-1]-d.timestamp.iloc[0]).days
+            if cal_days < 180:continue
+        except:continue
         x=indicators(d);a=completed(x)
         if a is None or pd.isna(a.vavg20) or a.vavg20<MIN_AVG20:continue
         tech=0;tech+=25 if a.close>a.ema50 else 0;tech+=25 if a.ema20>a.ema50 else 0;tech+=20 if a.close>a.ema200 else 0;tech+=15 if a.rsi>=50 else 0;tech+=15 if a.volume>a.vema20 else 0
-        rows_list.append({"symbol":sym,"token":str(r["token"]),"ltp":float(r["ltp"]),"sector":sector_name(sym),"tech":tech,"history":len(d)})
+        rows_list.append({"symbol":sym,"token":str(r["token"]),"ltp":float(r["ltp"]),"sector":sector_name(sym),"tech":tech,"history":cal_days,"candle_count":len(d)})
         daily_cache[str(r["token"])]=(d,x)
     if not rows_list:return [],[],daily_cache
     df=pd.DataFrame(rows_list)
     ss=df.groupby("sector").agg(avg_tech=("tech","mean"),breadth=("tech",lambda x:float((x>=60).mean()*100)),count=("tech","size")).reset_index()
     ss["score"]=ss.avg_tech*0.65+ss.breadth*0.35
-    known=ss.sort_values("score",ascending=False).head(TOP_SECTORS)
+    known=ss[ss.sector!="OTHER"].sort_values("score",ascending=False).head(TOP_SECTORS)
+    if len(known)<TOP_SECTORS:
+        other=ss[ss.sector=="OTHER"].sort_values("score",ascending=False)
+        known=pd.concat([known,other.head(TOP_SECTORS-len(known))])
     return known.sort_values("score",ascending=False).to_dict("records"),df.to_dict("records"),daily_cache
 
 def multi_tf_setup(s,tok,live,mbias,sector_score,f,daily_cache):
     tok=str(tok);cached=daily_cache.get(tok)
     if cached:daily,x=cached
     else:
-        daily=candles(s,tok,520,"ONE_DAY")
+        daily=candles(s,tok,DAILY_DAYS,"ONE_DAY")
         if daily is None:return None
         x=indicators(daily)
-    weekly=candles(s,tok,1800,"ONE_WEEK");monthly=candles(s,tok,3500,"ONE_MONTH")
+    weekly=candles(s,tok,WEEKLY_DAYS,"ONE_WEEK");monthly=candles(s,tok,MONTHLY_DAYS,"ONE_MONTH")
     if weekly is None or monthly is None or len(daily)<MIN_HISTORY or len(weekly)<80 or len(monthly)<24:return None
     w=indicators(weekly);m=indicators(monthly);a=completed(x);b=completed(w);c=completed(m)
     if any(v is None for v in [a,b,c]):return None
@@ -188,7 +204,7 @@ def multi_tf_setup(s,tok,live,mbias,sector_score,f,daily_cache):
 def stars(s):return "★★★★★" if s>=90 else "★★★★☆" if s>=80 else "★★★☆☆" if s>=70 else "★★☆☆☆"
 
 def main():
-    print(f"=== DIVINE SECTOR SWING V5.2 | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
+    print(f"=== DIVINE SECTOR SWING V5.4 | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
     s=login();m=master();em=equity_master(m)
     mbias,mval=market_mood(s);print(f"MARKET MOOD: {mbias} | score {mval}",flush=True)
     q=quotes(s,em.token.tolist())
@@ -201,7 +217,7 @@ def main():
     print(f"HIGH-VOLUME UNIVERSE: {len(q)}",flush=True)
     sectors,universe,daily_cache=sector_scan(s,q)
     if not sectors:
-        out=f"⚡ DIVINE SECTOR SWING V5.2\n{datetime.now(IST):%d-%b %H:%M IST}\nMarket: {mbias}\n\n⚠️ No strong sector found.";print(out);tg(out);return
+        out=f"⚡ DIVINE SECTOR SWING V5.4\n{datetime.now(IST):%d-%b %H:%M IST}\nMarket: {mbias}\n\n⚠️ No strong sector found.";print(out);tg(out);return
     print("SECTORS:",", ".join(f'{z["sector"]} {z["score"]:.1f}' for z in sectors),flush=True)
     secset={z["sector"]:z["score"] for z in sectors}
     candidates=[z for z in universe if z["sector"] in secset]
@@ -209,10 +225,10 @@ def main():
     for z in candidates:bysec.setdefault(z["sector"],[]).append(z)
     final_candidates=[]
     for sec,lst in bysec.items():final_candidates+=sorted(lst,key=lambda z:z["tech"],reverse=True)[:TOP_STOCKS_PER_SECTOR]
-    print(f"TOP STOCKS: {len(final_candidates)} | 180D HISTORY: ON | IPO FILTER: OFF",flush=True)
+    print(f"TOP STOCKS: {len(final_candidates)} | 180D DUAL FILTER: ON | ETF FILTER: ON | IPO AUTO AGE",flush=True)
     results=[]
     for n,z in enumerate(final_candidates,1):
-        print(f"[{n}/{len(final_candidates)}] {z['symbol']} | {z['sector']}",flush=True)
+        print(f"[{n}/{len(final_candidates)}] {z['symbol']} | {z['sector']} | {z['history']}D / {z['candle_count']}c",flush=True)
         f=fundamental(z["symbol"]);time.sleep(FUND_DELAY)
         if f is None:f={"fund_score":15,"roce":"NA","roe":"NA","de":"NA","sales5":"NA","profit5":"NA","eps5":"NA","qsales":"NA","qprofit":"NA","source":"NA"}
         if f.get("source")!="NA" and f.get("fund_score",0)<MIN_FUND:continue
@@ -222,13 +238,13 @@ def main():
             results.append(setup)
     results.sort(key=lambda x:(x["score"],x["daily"],x["weekly"],x["monthly"],x["volx"]),reverse=True)
     sig=results[:TOP_SIGNALS]
-    msg=[f"🔥 DIVINE SECTOR SWING V5.2 | {datetime.now(IST):%d-%b %H:%M IST}",f"Market Mood: {mbias} ({mval:+d})","Sector Ranking: "+" | ".join(f'{i+1}. {z["sector"]} {z["score"]:.1f}' for i,z in enumerate(sectors)),f"180D HISTORY: ON | IPO FILTER: OFF | Fundamental: ON | Analysed: {len(final_candidates)}","🟢 Entry = LIVE Angel LTP at scan time",""]
+    msg=[f"🔥 DIVINE SECTOR SWING V5.4 | {datetime.now(IST):%d-%b %H:%M IST}",f"Market Mood: {mbias} ({mval:+d})","Sector Ranking: "+" | ".join(f'{i+1}. {z["sector"]} {z["score"]:.1f}' for i,z in enumerate(sectors)),f"180D DUAL: Candles>=180 & Calendar>=180 | ETF: ON | IPO: AUTO AGE | Analysed: {len(final_candidates)}","🟢 Entry = LIVE Angel LTP",""]
     if sig:
         msg.append("🏆 TOP 3 SWING SETUPS")
         for i,z in enumerate(sig,1):
             f=z["fund_data"] or {};src=f.get("source","NA")
             txt=(f"\n#{i} {z['symbol']} BUY {stars(z['score'])} {z['score']}/100\n"
-                 f"Sector: {z['sector']} | Sector Score {z['sector_score']:.1f} | Hist {z['history']}D\n"
+                 f"Sector: {z['sector']} | Score {z['sector_score']:.1f} | Hist {z['history']}D\n"
                  f"Setup: {z['setup']}\n"
                  f"LTP/Entry {z['entry']:.2f}\n"
                  f"SL {z['sl']:.2f} | T1 {z['t1']:.2f} | T2 {z['t2']:.2f} | T3 {z['t3']:.2f}\n"
@@ -239,10 +255,10 @@ def main():
             msg.append(txt)
     else:
         msg.append("⚠️ NO QUALIFYING SWING SETUP")
-        msg.append(f"No stock passed Monthly + Weekly + Daily + 180D filters. Analysed: {len(final_candidates)}")
+        msg.append(f"Dual 180D passed: {len(final_candidates)} | Bearish alignment failed")
     out="\n".join(msg);print(out,flush=True);tg(out)
 
 if __name__=="__main__":
     try:main()
     except Exception as e:
-        print("ERROR:",e,flush=True);tg(f"❌ SECTOR SWING V5.2 ERROR\n{e}");raise
+        print("ERROR:",e,flush=True);tg(f"❌ SECTOR SWING V5.4 ERROR\n{e}");raise
