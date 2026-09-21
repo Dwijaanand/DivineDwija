@@ -2,37 +2,22 @@ import os,time,requests,pyotp,pandas as pd,numpy as np,re,logging
 from datetime import datetime,timedelta
 from SmartApi import SmartConnect
 import pytz
-
 logging.getLogger("smartapi.smartConnect").setLevel(logging.ERROR)
 
 API_KEY=os.getenv("API_KEY");CLIENT_ID=os.getenv("CLIENT_ID");PASSWORD=os.getenv("PASSWORD");TOTP_SECRET=os.getenv("TOTP_SECRET")
 TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN");TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-# ===================== SETTINGS =====================
-MIN_PRICE=50
-MIN_VOL=100000
-MIN_AVG20=50000
+MIN_PRICE=50;MIN_VOL=100000;MIN_AVG20=50000
 MIN_HISTORY=180
-
 TOP_STOCKS_PER_SECTOR=12
 TOP_SECTORS=3
 TOP_SIGNALS=3
 MIN_SCORE=70
 MIN_FUND=10
-
-DAILY_DAYS=520
-WEEKLY_DAYS=1800
-MONTHLY_DAYS=3500
-
-REQUEST_DELAY=.35
-FUND_DELAY=.25
-QUOTE_BATCH=50
-QUOTE_DELAY=1.02
-
+DAILY_DAYS=520;WEEKLY_DAYS=1800;MONTHLY_DAYS=3500
+FUND_DELAY=.25;QUOTE_BATCH=50;QUOTE_DELAY=1.02
 IST=pytz.timezone("Asia/Kolkata")
-
-# Deliberate exclusions only. IPOs are filtered dynamically by available daily history.
 EXCLUDED={"LTIM","TATAMOTORS"}
 
 SECTOR_MAP={
@@ -56,613 +41,215 @@ SECTOR_MAP={
 
 def tg(x):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id":TELEGRAM_CHAT_ID,"text":x},timeout=12
-            )
-        except:
-            pass
-
+        try:requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",data={"chat_id":TELEGRAM_CHAT_ID,"text":x},timeout=12)
+        except:pass
 def login():
     s=SmartConnect(api_key=API_KEY)
     r=s.generateSession(CLIENT_ID,PASSWORD,pyotp.TOTP(TOTP_SECRET).now())
-    if not r or not r.get("status"):
-        raise RuntimeError("Angel login failed")
+    if not r or not r.get("status"):raise RuntimeError("Angel login failed")
     return s
-
 def master():
     x=pd.DataFrame(requests.get(MASTER_URL,timeout=30).json())
-    x["token"]=x["token"].astype(str)
-    x["symbol"]=x["symbol"].astype(str)
-    return x
-
-def equity_master(m):
-    return m[(m["exch_seg"]=="NSE")&m["symbol"].str.endswith("-EQ")].copy()
-
+    x["token"]=x["token"].astype(str);x["symbol"]=x["symbol"].astype(str);return x
+def equity_master(m):return m[(m["exch_seg"]=="NSE")&m["symbol"].str.endswith("-EQ")].copy()
 def quotes(s,tokens):
     out=[]
     for i in range(0,len(tokens),QUOTE_BATCH):
         try:
-            r=s.getMarketData("FULL",{"NSE":[str(x) for x in tokens[i:i+QUOTE_BATCH]]})
-            d=(r or {}).get("data",{})
-            out+=(d.get("fetched",[]) if isinstance(d,dict) else [])
-        except:
-            pass
+            r=s.getMarketData("FULL",{"NSE":[str(x) for x in tokens[i:i+QUOTE_BATCH]]});d=(r or {}).get("data",{});out+=(d.get("fetched",[]) if isinstance(d,dict) else [])
+        except:pass
         time.sleep(QUOTE_DELAY)
     return pd.DataFrame(out)
-
 def candles(s,tok,days,interval,exchange="NSE"):
     try:
-        e=datetime.now()
-        b=e-timedelta(days=days)
-        r=s.getCandleData({
-            "exchange":exchange,"symboltoken":str(tok),"interval":interval,
-            "fromdate":b.strftime("%Y-%m-%d %H:%M"),
-            "todate":e.strftime("%Y-%m-%d %H:%M")
-        })
+        e=datetime.now();b=e-timedelta(days=days)
+        r=s.getCandleData({"exchange":exchange,"symboltoken":str(tok),"interval":interval,"fromdate":b.strftime("%Y-%m-%d %H:%M"),"todate":e.strftime("%Y-%m-%d %H:%M")})
         d=(r or {}).get("data")
-        if not d:
-            return None
+        if not d:return None
         x=pd.DataFrame(d,columns=["timestamp","open","high","low","close","volume"])
         x["timestamp"]=pd.to_datetime(x.timestamp,errors="coerce")
-        for c in ["open","high","low","close","volume"]:
-            x[c]=pd.to_numeric(x[c],errors="coerce")
-        x=x.dropna(subset=["timestamp","close"]).sort_values("timestamp").reset_index(drop=True)
-        return x
-    except:
-        return None
-
+        for c in ["open","high","low","close","volume"]:x[c]=pd.to_numeric(x[c],errors="coerce")
+        return x.dropna(subset=["timestamp","close"]).sort_values("timestamp").reset_index(drop=True)
+    except:return None
 def rsi(s,n=14):
-    d=s.diff()
-    u=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean()
-    v=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
+    d=s.diff();u=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean();v=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
     return 100-100/(1+u/v.replace(0,np.nan))
-
 def indicators(x):
     x=x.copy()
-    for n in [10,20,30,50,100,200]:
-        x[f"ema{n}"]=x.close.ewm(span=n,adjust=False).mean()
+    for n in [10,20,30,50,100,200]:x[f"ema{n}"]=x.close.ewm(span=n,adjust=False).mean()
     x["rsi"]=rsi(x.close)
-    tr=pd.concat([
-        x.high-x.low,
-        (x.high-x.close.shift()).abs(),
-        (x.low-x.close.shift()).abs()
-    ],axis=1).max(axis=1)
-    x["atr"]=tr.ewm(span=14,adjust=False).mean()
-    x["vavg20"]=x.volume.rolling(20).mean()
-    x["vema20"]=x.volume.ewm(span=20,adjust=False).mean()
-    x["volx"]=x.volume/x.vavg20.replace(0,np.nan)
-    x["volemx"]=x.volume/x.vema20.replace(0,np.nan)
-    x["prev20h"]=x.high.shift(1).rolling(20).max()
-    x["prev20l"]=x.low.shift(1).rolling(20).min()
+    tr=pd.concat([x.high-x.low,(x.high-x.close.shift()).abs(),(x.low-x.close.shift()).abs()],axis=1).max(axis=1)
+    x["atr"]=tr.ewm(span=14,adjust=False).mean();x["vavg20"]=x.volume.rolling(20).mean();x["vema20"]=x.volume.ewm(span=20,adjust=False).mean()
+    x["volx"]=x.volume/x.vavg20.replace(0,np.nan);x["volemx"]=x.volume/x.vema20.replace(0,np.nan)
+    x["prev20h"]=x.high.shift(1).rolling(20).max();x["prev20l"]=x.low.shift(1).rolling(20).min()
     return x
-
-def completed(x):
-    if x is None or len(x)<3:
-        return None
-    return x.iloc[-2]
-
-def clean_symbol(sym):
-    return str(sym).replace("-EQ","").upper().strip()
-
+def completed(x):return None if x is None or len(x)<3 else x.iloc[-2]
+def clean_symbol(sym):return str(sym).replace("-EQ","").upper().strip()
 def sector_name(sym):
     b=clean_symbol(sym)
     for k,v in SECTOR_MAP.items():
-        if b in v:
-            return k
+        if b in v:return k
     return "OTHER"
-
 def screener_symbol(sym):
-    b=clean_symbol(sym)
-    fixes={
-        "M&M":"M_M",
-        "BAJAJ-AUTO":"BAJAJAUTO",
-        "MOTHERSUMI":"MOTHERSON",
-        "L&TFH":"LTF"
-    }
+    b=clean_symbol(sym);fixes={"M&M":"M_M","BAJAJ-AUTO":"BAJAJAUTO","MOTHERSUMI":"MOTHERSON","L&TFH":"LTF"}
     return fixes.get(b,b.replace("&","_"))
-
 def num(v):
     try:
-        if v is None:
-            return np.nan
+        if v is None:return np.nan
         z=str(v).replace(",","").replace("%","").replace("₹","").strip()
-        if z in ("","-","--","None","nan"):
-            return np.nan
+        if z in ("","-","--","None","nan"):return np.nan
         return float(z)
-    except:
-        return np.nan
-
+    except:return np.nan
 def fund_score(f):
-    if not f:
-        return 0
+    if not f:return 0
     score=0
-    def ok(v):
-        return pd.notna(v)
-    if ok(f.get("roce")):
-        score+=20 if f["roce"]>=20 else 15 if f["roce"]>=15 else 8 if f["roce"]>=10 else 0
-    if ok(f.get("roe")):
-        score+=15 if f["roe"]>=20 else 10 if f["roe"]>=15 else 5 if f["roe"]>=10 else 0
-    if ok(f.get("de")):
-        score+=15 if f["de"]<=0.5 else 10 if f["de"]<=1 else 4 if f["de"]<=2 else 0
-    if ok(f.get("sales5")):
-        score+=10 if f["sales5"]>=10 else 6 if f["sales5"]>=5 else 0
-    if ok(f.get("profit5")):
-        score+=15 if f["profit5"]>=15 else 10 if f["profit5"]>=7 else 0
-    if ok(f.get("eps5")):
-        score+=10 if f["eps5"]>=15 else 5 if f["eps5"]>=7 else 0
-    if ok(f.get("qprofit")):
-        score+=5 if f["qprofit"]>0 else 0
-    if ok(f.get("qsales")):
-        score+=5 if f["qsales"]>0 else 0
-    if ok(f.get("pledge")):
-        score+=5 if f["pledge"]<1 else 2 if f["pledge"]<5 else 0
+    def ok(v):return pd.notna(v)
+    if ok(f.get("roce")):score+=20 if f["roce"]>=20 else 15 if f["roce"]>=15 else 8 if f["roce"]>=10 else 0
+    if ok(f.get("roe")):score+=15 if f["roe"]>=20 else 10 if f["roe"]>=15 else 5 if f["roe"]>=10 else 0
+    if ok(f.get("de")):score+=15 if f["de"]<=0.5 else 10 if f["de"]<=1 else 4 if f["de"]<=2 else 0
+    if ok(f.get("sales5")):score+=10 if f["sales5"]>=10 else 6 if f["sales5"]>=5 else 0
+    if ok(f.get("profit5")):score+=15 if f["profit5"]>=15 else 10 if f["profit5"]>=7 else 0
+    if ok(f.get("eps5")):score+=10 if f["eps5"]>=15 else 5 if f["eps5"]>=7 else 0
+    if ok(f.get("qprofit")):score+=5 if f["qprofit"]>0 else 0
+    if ok(f.get("qsales")):score+=5 if f["qsales"]>0 else 0
+    if ok(f.get("pledge")):score+=5 if f["pledge"]<1 else 2 if f["pledge"]<5 else 0
     return min(100,score)
-
 def fundamental(sym):
     try:
-        b=clean_symbol(sym)
-        url=f"https://www.screener.in/company/{screener_symbol(b)}/"
-        html=requests.get(
-            url,headers={"User-Agent":"Mozilla/5.0"},timeout=10
-        ).text
-        if "Company not found" in html or len(html)<5000:
-            return None
-
+        b=clean_symbol(sym);url=f"https://www.screener.in/company/{screener_symbol(b)}/"
+        html=requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=10).text
+        if "Company not found" in html or len(html)<5000:return None
         def grab(label):
             p=html.find(f">{label}<")
-            if p<0:
-                p=html.lower().find(label.lower())
-            if p<0:
-                return np.nan
-            chunk=html[p:p+1800]
-            m=re.search(r'<span[^>]*class="number"[^>]*>\s*([^<]+)',chunk)
-            if not m:
-                m=re.search(r'<td[^>]*>\s*([^<]+)',chunk)
+            if p<0:p=html.lower().find(label.lower())
+            if p<0:return np.nan
+            chunk=html[p:p+1800];m=re.search(r'<span[^>]*class="number"[^>]*>\s*([^<]+)',chunk)
+            if not m:m=re.search(r'<td[^>]*>\s*([^<]+)',chunk)
             return num(m.group(1)) if m else np.nan
-
-        vals={
-            "roce":grab("ROCE"),
-            "roe":grab("ROE"),
-            "de":grab("Debt to equity"),
-            "pe":grab("P/E"),
-            "pledge":grab("Pledged"),
-            "sales5":grab("Sales growth 5Years"),
-            "profit5":grab("Profit growth 5Years"),
-            "eps5":grab("EPS growth 5Years"),
-            "qsales":grab("YOY Quarterly sales growth"),
-            "qprofit":grab("YOY Quarterly profit growth")
-        }
+        vals={"roce":grab("ROCE"),"roe":grab("ROE"),"de":grab("Debt to equity"),"pe":grab("P/E"),"pledge":grab("Pledged"),"sales5":grab("Sales growth 5Years"),"profit5":grab("Profit growth 5Years"),"eps5":grab("EPS growth 5Years"),"qsales":grab("YOY Quarterly sales growth"),"qprofit":grab("YOY Quarterly profit growth")}
         vals["available"]=sum(pd.notna(v) for v in vals.values())>=3
-        if not vals["available"]:
-            return None
-        vals["fund_score"]=fund_score(vals)
-        vals["source"]="Screener"
-        return vals
-    except:
-        return None
-
+        if not vals["available"]:return None
+        vals["fund_score"]=fund_score(vals);vals["source"]="Screener";return vals
+    except:return None
 def market_mood(s):
     vals=[]
-    for name,tok,ex in [
-        ("NIFTY","99926000","NSE"),
-        ("SENSEX","99919000","BSE")
-    ]:
+    for name,tok,ex in [("NIFTY","99926000","NSE"),("SENSEX","99919000","BSE")]:
         d=candles(s,tok,45,"ONE_DAY",ex)
-        if d is None or len(d)<25:
-            continue
-        x=indicators(d)
-        a=completed(x)
-        if a is None:
-            continue
-        bull=a.close>a.ema20>a.ema50 and a.rsi>=50
-        bear=a.close<a.ema20<a.ema50 and a.rsi<=50
+        if d is None or len(d)<25:continue
+        x=indicators(d);a=completed(x)
+        if a is None:continue
+        bull=a.close>a.ema20>a.ema50 and a.rsi>=50;bear=a.close<a.ema20<a.ema50 and a.rsi<=50
         vals.append(1 if bull else -1 if bear else 0)
-    z=sum(vals)
-    return ("BULLISH" if z>0 else "BEARISH" if z<0 else "NEUTRAL"),z
+    z=sum(vals);return ("BULLISH" if z>0 else "BEARISH" if z<0 else "NEUTRAL"),z
 
-# Sector scan also caches the completed daily data.
 def sector_scan(s,q):
-    rows=[]
-    daily_cache={}
-
+    rows=[];daily_cache={}
     for _,r in q.iterrows():
-        sym=r["symbol"]
-        b=clean_symbol(sym)
-        if b in EXCLUDED:
-            continue
-
-        d=candles(s,r["token"],DAILY_DAYS,"ONE_DAY")
-        if d is None or len(d)<MIN_HISTORY:
-            # Dynamic 180-day IPO/history filter:
-            # stocks without at least 180 daily candles are ignored.
-            continue
-
-        x=indicators(d)
-        a=completed(x)
-        if a is None:
-            continue
-
-        if pd.isna(a.vavg20) or a.vavg20<MIN_AVG20:
-            continue
-
-        tech=0
-        tech+=25 if a.close>a.ema50 else 0
-        tech+=25 if a.ema20>a.ema50 else 0
-        tech+=20 if a.close>a.ema200 else 0
-        tech+=15 if a.rsi>=50 else 0
-        tech+=15 if a.volume>a.vema20 else 0
-
-        sec=sector_name(sym)
-        rows.append({
-            "symbol":sym,
-            "token":str(r["token"]),
-            "ltp":float(r["ltp"]),
-            "sector":sec,
-            "tech":tech,
-            "history":len(d)
-        })
+        sym=r["symbol"];b=clean_symbol(sym)
+        if b in EXCLUDED:continue
+        d=candles(s,r["token"],520,"ONE_DAY")
+        # 180D HISTORY FILTER = actual IPO filter. No separate IPO_BLOCK needed.
+        if d is None or len(d) < MIN_HISTORY:continue
+        x=indicators(d);a=completed(x)
+        if a is None or pd.isna(a.vavg20) or a.vavg20<MIN_AVG20:continue
+        tech=0;tech+=25 if a.close>a.ema50 else 0;tech+=25 if a.ema20>a.ema50 else 0;tech+=20 if a.close>a.ema200 else 0;tech+=15 if a.rsi>=50 else 0;tech+=15 if a.volume>a.vema20 else 0
+        rows.append({"symbol":sym,"token":str(r["token"]),"ltp":float(r["ltp"]),"sector":sector_name(sym),"tech":tech,"history":len(d)})
         daily_cache[str(r["token"])]=(d,x)
-
-    if not rows:
-        return [],[],daily_cache
-
+    if not rows:return [],[],daily_cache
     df=pd.DataFrame(rows)
-
-    ss=df.groupby("sector").agg(
-        avg_tech=("tech","mean"),
-        breadth=("tech",lambda x:float((x>=60).mean()*100)),
-        count=("tech","size")
-    ).reset_index()
-
+    ss=df.groupby("sector").agg(avg_tech=("tech","mean"),breadth=("tech",lambda x:float((x>=60).mean()*100)),count=("tech","size")).reset_index()
     ss["score"]=ss.avg_tech*0.65+ss.breadth*0.35
-
-    # OTHER is not allowed to occupy one of the 3 main sector slots.
     known=ss[ss.sector!="OTHER"].sort_values("score",ascending=False).head(TOP_SECTORS)
     if len(known)<TOP_SECTORS:
         other=ss[ss.sector=="OTHER"].sort_values("score",ascending=False)
         known=pd.concat([known,other.head(TOP_SECTORS-len(known))])
-
     return known.sort_values("score",ascending=False).to_dict("records"),df.to_dict("records"),daily_cache
 
 def multi_tf_setup(s,tok,live,mbias,sector_score,f,daily_cache):
-    tok=str(tok)
-
-    # Reuse daily data from sector scan: avoids duplicate Angel candle calls.
-    cached=daily_cache.get(tok)
-    if cached:
-        daily,x=cached
+    tok=str(tok);cached=daily_cache.get(tok)
+    if cached:daily,x=cached
     else:
-        daily=candles(s,tok,DAILY_DAYS,"ONE_DAY")
-        if daily is None:
-            return None
+        daily=candles(s,tok,520,"ONE_DAY")
+        if daily is None:return None
         x=indicators(daily)
-
-    weekly=candles(s,tok,WEEKLY_DAYS,"ONE_WEEK")
-    monthly=candles(s,tok,MONTHLY_DAYS,"ONE_MONTH")
-
-    if weekly is None or monthly is None:
-        return None
-    if len(daily)<MIN_HISTORY or len(weekly)<80 or len(monthly)<24:
-        return None
-
-    w=indicators(weekly)
-    m=indicators(monthly)
-
-    a=completed(x)
-    b=completed(w)
-    c=completed(m)
-
-    if any(v is None for v in [a,b,c]):
-        return None
-
-    # ---------- MONTHLY QUALITY FILTER ----------
-    mon=0
-    mon+=25 if c.close>c.ema10 else 0
-    mon+=25 if c.ema10>c.ema30 else 0
-    mon+=25 if c.close>c.ema100 else 0
-    mon+=15 if c.rsi>=50 else 0
-    mon+=10 if c.volume>c.vema20 else 0
-
-    # ---------- WEEKLY TREND CONFIRMATION ----------
-    wk=0
-    wk+=20 if b.close>b.ema10 else 0
-    wk+=20 if b.ema10>b.ema30 else 0
-    wk+=20 if b.close>b.ema100 else 0
-    wk+=15 if b.rsi>=50 else 0
-    wk+=15 if b.volume>b.vema20 else 0
-    wk+=10 if b.volx>=1.0 else 0
-
-    # ---------- DAILY SWING SETUP ----------
-    dy=0
-    dy+=15 if a.close>a.ema20 else 0
-    dy+=15 if a.ema20>a.ema50 else 0
-    dy+=15 if a.close>a.ema200 else 0
-    dy+=10 if 52<=a.rsi<=72 else 0
-    dy+=15 if a.volume>a.vema20 else 0
-    dy+=10 if a.volemx>=1.2 else 0
-    dy+=10 if a.close>a.prev20h else 0
-    dy+=10 if a.close>a.open else 0
-
-    # Full multi-timeframe alignment.
-    aligned=(
-        c.close>c.ema10>c.ema30 and
-        b.close>b.ema10>b.ema30 and
-        a.close>a.ema20>a.ema50
-    )
-    if not aligned:
-        return None
-
-    if pd.isna(a.vema20) or a.volemx<1.0:
-        return None
-
-    # ---------- LIVE ENTRY / RISK ----------
-    atr=max(float(a.atr),live*.005)
-    swing=float(daily.low.iloc[-12:-2].min())
-    sl=min(live-atr,swing-.20*atr)
-    if sl>=live:
-        sl=live-atr
-
+    weekly=candles(s,tok,1800,"ONE_WEEK");monthly=candles(s,tok,3500,"ONE_MONTH")
+    if weekly is None or monthly is None or len(daily)<MIN_HISTORY or len(weekly)<80 or len(monthly)<24:return None
+    w=indicators(weekly);m=indicators(monthly);a=completed(x);b=completed(w);c=completed(m)
+    if any(v is None for v in [a,b,c]):return None
+    mon=0;mon+=25 if c.close>c.ema10 else 0;mon+=25 if c.ema10>c.ema30 else 0;mon+=25 if c.close>c.ema100 else 0;mon+=15 if c.rsi>=50 else 0;mon+=10 if c.volume>c.vema20 else 0
+    wk=0;wk+=20 if b.close>b.ema10 else 0;wk+=20 if b.ema10>b.ema30 else 0;wk+=20 if b.close>b.ema100 else 0;wk+=15 if b.rsi>=50 else 0;wk+=15 if b.volume>b.vema20 else 0;wk+=10 if b.volx>=1.0 else 0
+    dy=0;dy+=15 if a.close>a.ema20 else 0;dy+=15 if a.ema20>a.ema50 else 0;dy+=15 if a.close>a.ema200 else 0;dy+=10 if 52<=a.rsi<=72 else 0;dy+=15 if a.volume>a.vema20 else 0;dy+=10 if a.volemx>=1.2 else 0;dy+=10 if a.close>a.prev20h else 0;dy+=10 if a.close>a.open else 0
+    if not (c.close>c.ema10>c.ema30 and b.close>b.ema10>b.ema30 and a.close>a.ema20>a.ema50):return None
+    if pd.isna(a.vema20) or a.volemx<1.0:return None
+    atr=max(float(a.atr),live*.005);swing=float(daily.low.iloc[-12:-2].min());sl=min(live-atr,swing-.20*atr)
+    if sl>=live:sl=live-atr
     risk=live-sl
-    if risk/live<.006:
-        return None
+    if risk/live<.006:return None
+    t1=live+1.5*risk;t2=live+2.0*risk;t3=live+3.0*risk
+    fund=f.get("fund_score",15) if f else 15;fund_pts=round(fund*.20);market_pts=8 if mbias=="BULLISH" else 0 if mbias=="NEUTRAL" else -8;sec_pts=min(15,round(sector_score*.15))
+    total=min(100,round(mon*.15+wk*.20+dy*.20+fund_pts+sec_pts+max(0,market_pts)))
+    if mbias=="BEARISH":total=max(0,total-8)
+    if total<MIN_SCORE:return None
+    return {"direction":"BUY","score":total,"fund":fund,"fund_pts":fund_pts,"monthly":mon,"weekly":wk,"daily":dy,"sector_pts":sec_pts,"market_pts":market_pts,"entry":live,"sl":sl,"t1":t1,"t2":t2,"t3":t3,"rsi":float(a.rsi),"volx":float(a.volx),"daily_volemx":float(a.volemx),"weekly_volx":float(b.volx),"monthly_volx":float(c.volx),"setup":"BREAKOUT + VOLUME" if pd.notna(a.prev20h) and a.close>a.prev20h and a.volemx>=1.2 else "EMA TREND + VOLUME"}
 
-    t1=live+1.5*risk
-    t2=live+2.0*risk
-    t3=live+3.0*risk
-
-    # ---------- FUNDAMENTAL + MARKET + SECTOR ----------
-    fund=f.get("fund_score",15) if f else 15
-    fund_pts=round(fund*.20)
-
-    market_pts=8 if mbias=="BULLISH" else 0 if mbias=="NEUTRAL" else -8
-    sec_pts=min(15,round(sector_score*.15))
-
-    total=min(
-        100,
-        round(
-            mon*.15+
-            wk*.20+
-            dy*.20+
-            fund_pts+
-            sec_pts+
-            max(0,market_pts)
-        )
-    )
-
-    if mbias=="BEARISH":
-        total=max(0,total-8)
-
-    if total<MIN_SCORE:
-        return None
-
-    return {
-        "direction":"BUY",
-        "score":total,
-        "fund":fund,
-        "fund_pts":fund_pts,
-        "monthly":mon,
-        "weekly":wk,
-        "daily":dy,
-        "sector_pts":sec_pts,
-        "market_pts":market_pts,
-        "entry":live,
-        "sl":sl,
-        "t1":t1,
-        "t2":t2,
-        "t3":t3,
-        "rsi":float(a.rsi),
-        "volx":float(a.volx),
-        "daily_volemx":float(a.volemx),
-        "weekly_volx":float(b.volx),
-        "monthly_volx":float(c.volx),
-        "setup":"BREAKOUT + VOLUME" if pd.notna(a.prev20h) and a.close>a.prev20h and a.volemx>=1.2 else "EMA TREND + VOLUME"
-    }
-
-def stars(s):
-    return "★★★★★" if s>=90 else "★★★★☆" if s>=80 else "★★★☆☆" if s>=70 else "★★☆☆☆"
+def stars(s):return "★★★★★" if s>=90 else "★★★★☆" if s>=80 else "★★★☆☆" if s>=70 else "★★☆☆☆"
 
 def main():
-    print(
-        f"=== DIVINE SECTOR SWING V5.0 | "
-        f"{datetime.now(IST):%d %b %H:%M:%S IST} ===",
-        flush=True
-    )
-
-    s=login()
-    m=master()
-    em=equity_master(m)
-
-    # 1) MARKET MOOD
-    mbias,mval=market_mood(s)
-    print(f"MARKET MOOD: {mbias} | score {mval}",flush=True)
-
-    # 2) HIGH-VOLUME STOCK UNIVERSE
+    print(f"=== DIVINE SECTOR SWING V5.1 | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
+    s=login();m=master();em=equity_master(m)
+    mbias,mval=market_mood(s);print(f"MARKET MOOD: {mbias} | score {mval}",flush=True)
     q=quotes(s,em.token.tolist())
-    if q.empty:
-        tg("⚠️ Sector Swing: live quotes unavailable")
-        return
-
-    q["symbolToken"]=q.symbolToken.astype(str)
-    q["ltp"]=pd.to_numeric(q.ltp,errors="coerce")
-    q["tradeVolume"]=pd.to_numeric(q.tradeVolume,errors="coerce")
-    q=q.dropna(subset=["symbolToken","ltp","tradeVolume"])
-
-    q=q[
-        (q.ltp>=MIN_PRICE)&
-        (q.tradeVolume>=MIN_VOL)
-    ]
-
-    q=q.merge(
-        em[["symbol","token"]].drop_duplicates("token"),
-        left_on="symbolToken",
-        right_on="token",
-        how="left"
-    ).dropna(subset=["symbol"])
-
-    q=q[
-        q.symbol.map(clean_symbol).map(
-            lambda x:x not in EXCLUDED
-        )
-    ]
-
-    # High-volume universe only. Daily history below 180 days is removed later.
+    if q.empty:tg("⚠️ Sector Swing: live quotes unavailable");return
+    q["symbolToken"]=q.symbolToken.astype(str);q["ltp"]=pd.to_numeric(q.ltp,errors="coerce");q["tradeVolume"]=pd.to_numeric(q.tradeVolume,errors="coerce")
+    q=q.dropna(subset=["symbolToken","ltp","tradeVolume"]);q=q[(q.ltp>=MIN_PRICE)&(q.tradeVolume>=MIN_VOL)]
+    q=q.merge(em[["symbol","token"]].drop_duplicates("token"),left_on="symbolToken",right_on="token",how="left").dropna(subset=["symbol"])
+    q=q[q.symbol.map(clean_symbol).map(lambda x:x not in EXCLUDED)]
     q=q.sort_values("tradeVolume",ascending=False).head(220)
-
     print(f"HIGH-VOLUME UNIVERSE: {len(q)}",flush=True)
-
-    # 3) SECTOR RANKING
     sectors,universe,daily_cache=sector_scan(s,q)
-
     if not sectors:
-        out=(
-            f"⚡ DIVINE SECTOR SWING V5.0\n"
-            f"{datetime.now(IST):%d-%b %H:%M IST}\n"
-            f"Market: {mbias}\n\n"
-            f"⚠️ No strong sector found."
-        )
-        print(out)
-        tg(out)
-        return
-
-    print(
-        "SECTORS:",
-        ", ".join(
-            f'{z["sector"]} {z["score"]:.1f}'
-            for z in sectors
-        ),
-        flush=True
-    )
-
-    # 4) TOP STOCKS FROM TOP SECTORS
+        out=f"⚡ DIVINE SECTOR SWING V5.1\n{datetime.now(IST):%d-%b %H:%M IST}\nMarket: {mbias}\n\n⚠️ No strong sector found.";print(out);tg(out);return
+    print("SECTORS:",", ".join(f'{z["sector"]} {z["score"]:.1f}' for z in sectors),flush=True)
     secset={z["sector"]:z["score"] for z in sectors}
-    candidates=[
-        z for z in universe
-        if z["sector"] in secset
-    ]
-
+    candidates=[z for z in universe if z["sector"] in secset]
     bysec={}
-    for z in candidates:
-        bysec.setdefault(z["sector"],[]).append(z)
-
+    for z in candidates:bysec.setdefault(z["sector"],[]).append(z)
     final_candidates=[]
-    for sec,lst in bysec.items():
-        final_candidates += sorted(
-            lst,key=lambda z:z["tech"],reverse=True
-        )[:TOP_STOCKS_PER_SECTOR]
-
-    print(
-        f"TOP STOCKS: {len(final_candidates)} | "
-        f"180D+ HISTORY FILTER: ON",
-        flush=True
-    )
-
-    # 5) FUNDAMENTAL -> MONTHLY -> WEEKLY -> DAILY
+    for sec,lst in bysec.items():final_candidates+=sorted(lst,key=lambda z:z["tech"],reverse=True)[:TOP_STOCKS_PER_SECTOR]
+    print(f"TOP STOCKS: {len(final_candidates)} | 180D HISTORY FILTER: ON | IPO FILTER: OFF",flush=True)
     results=[]
-
     for n,z in enumerate(final_candidates,1):
-        print(
-            f"[{n}/{len(final_candidates)}] "
-            f"{z['symbol']} | {z['sector']}",
-            flush=True
-        )
-
-        f=fundamental(z["symbol"])
-        time.sleep(FUND_DELAY)
-
-        # Fundamental data unavailable:
-        # do not kill a technically valid swing setup.
-        if f is None:
-            f={
-                "fund_score":15,
-                "roce":"NA",
-                "roe":"NA",
-                "de":"NA",
-                "sales5":"NA",
-                "profit5":"NA",
-                "eps5":"NA",
-                "qsales":"NA",
-                "qprofit":"NA",
-                "source":"NA"
-            }
-
-        # If real fundamental data exists and is genuinely weak, skip.
-        if (
-            f.get("source")!="NA" and
-            f.get("fund_score",0)<MIN_FUND
-        ):
-            continue
-
-        setup=multi_tf_setup(
-            s,
-            z["token"],
-            z["ltp"],
-            mbias,
-            secset[z["sector"]],
-            f,
-            daily_cache
-        )
-
+        print(f"[{n}/{len(final_candidates)}] {z['symbol']} | {z['sector']}",flush=True)
+        f=fundamental(z["symbol"]);time.sleep(FUND_DELAY)
+        if f is None:f={"fund_score":15,"roce":"NA","roe":"NA","de":"NA","sales5":"NA","profit5":"NA","eps5":"NA","qsales":"NA","qprofit":"NA","source":"NA"}
+        if f.get("source")!="NA" and f.get("fund_score",0)<MIN_FUND:continue
+        setup=multi_tf_setup(s,z["token"],z["ltp"],mbias,secset[z["sector"]],f,daily_cache)
         if setup:
-            setup.update({
-                "symbol":z["symbol"],
-                "sector":z["sector"],
-                "live_ltp":z["ltp"],
-                "sector_score":secset[z["sector"]],
-                "fund_data":f,
-                "history":z["history"]
-            })
+            setup.update({"symbol":z["symbol"],"sector":z["sector"],"live_ltp":z["ltp"],"sector_score":secset[z["sector"]],"fund_data":f,"history":z["history"]})
             results.append(setup)
-
-    # 6) STRONGEST SETUP FIRST
-    results.sort(
-        key=lambda x:(
-            x["score"],
-            x["daily"],
-            x["weekly"],
-            x["monthly"],
-            x["volx"]
-        ),
-        reverse=True
-    )
-
+    results.sort(key=lambda x:(x["score"],x["daily"],x["weekly"],x["monthly"],x["volx"]),reverse=True)
     sig=results[:TOP_SIGNALS]
-
-    # 7) TELEGRAM
-    msg=[
-        f"🔥 DIVINE SECTOR SWING V5.0 | "
-        f"{datetime.now(IST):%d-%b %H:%M IST}",
-        f"Market Mood: {mbias} ({mval:+d})",
-        "Sector Ranking: "+
-        " | ".join(
-            f'{i+1}. {z["sector"]} {z["score"]:.1f}'
-            for i,z in enumerate(sectors)
-        ),
-        (
-            f"180D HISTORY: ON | IPO NEW-LISTING FILTER: ON | "
-            f"Fundamental: ON | Analysed: {len(final_candidates)}"
-        ),
-        "🟢 Entry = LIVE Angel LTP at scan time",
-        ""
-    ]
-
+    msg=[f"🔥 DIVINE SECTOR SWING V5.1 | {datetime.now(IST):%d-%b %H:%M IST}",f"Market Mood: {mbias} ({mval:+d})","Sector Ranking: "+" | ".join(f'{i+1}. {z["sector"]} {z["score"]:.1f}' for i,z in enumerate(sectors)),f"180D HISTORY: ON | IPO FILTER: OFF | Fundamental: ON | Analysed: {len(final_candidates)}","🟢 Entry = LIVE Angel LTP at scan time",""]
     if sig:
         msg.append("🏆 TOP 3 SWING SETUPS")
-
         for i,z in enumerate(sig,1):
-            f=z["fund_data"] or {}
-            src=f.get("source","NA")
+            f=z["fund_data"] or {};src=f.get("source","NA")
+            txt=(f"\n#{i} {z['symbol']} BUY {stars(z['score'])} {z['score']}/100\n"
+                 f"Sector: {z['sector']} | Sector Score {z['sector_score']:.1f} | Hist {z['history']}D\n"
+                 f"Setup: {z['setup']}\n"
+                 f"LTP/Entry {z['entry']:.2f}\n"
+                 f"SL {z['sl']:.2f} | T1 {z['t1']:.2f} | T2 {z['t2']:.2f} | T3 {z['t3']:.2f}\n"
+                 f"Monthly {z['monthly']}/100 | Weekly {z['weekly']}/100 | Daily {z['daily']}/100\n"
+                 f"Fund {z['fund']}/100 ({src}) | Market {z['market_pts']:+d}\n"
+                 f"ROCE {f.get('roce','NA')} | ROE {f.get('roe','NA')} | D/E {f.get('de','NA')}\n"
+                 f"RSI {z['rsi']:.1f} | VolX {z['volx']:.2f}x")
+            msg.append(txt)
+    else:
+        msg.append("⚠️ NO QUALIFYING SWING SETUP")
+        msg.append(f"No stock passed Monthly + Weekly + Daily + 180D filters. Analysed: {len(final_candidates)}")
+    out="\n".join(msg);print(out,flush=True);tg(out)
 
-            msg.append(
-                f'\n#{i} {z["symbol"]} BUY '
-                f'{stars(z["score"])} {z["score"]}/100'
-                f'\nSector: {z["sector"]} | '
-                f'Sector Score {z["sector_score"]:.1f}'
-                f'\nSetup: {z["setup"]}'
-                f'\nLTP/Entry ₹{z["entry"]:.2f}'
-                f'\nSL ₹{z["sl"]:.2f} | '
-                f'T1 ₹{z["t1"]:.2f} | '
-                f'T2 ₹{z["t2"]:.2f} | '
-                f'T3 ₹{z["t3"]:.2f}'
-                f'\n
+if __name__=="__main__":
+    try:main()
+    except Exception as e:
+        print("ERROR:",e,flush=True);tg(f"❌ SECTOR SWING V5.1 ERROR\n{e}");raise
