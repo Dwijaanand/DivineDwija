@@ -12,10 +12,9 @@ TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-# FIXED SETTINGS
 MIN_PRICE=100
-MIN_VOL=200000
-TOP_UNIVERSE=25
+MIN_VOL=50000 # TESTING ke liye kam kiya, baad me 200000 kar dena
+TOP_UNIVERSE=50
 INTRADAY_UNIVERSE=15
 TOP_SIGNALS=3
 MIN_SCORE=70
@@ -81,8 +80,8 @@ def option_master(m):
 def all_underlyings(om):
     u=set()
     for s in om["symbol"].astype(str):
-        m=re.match(r'^([A-Z0-9&\-\_]+)',s.upper())
-        if m and len(m.group(1))>=3: u.add(m.group(1))
+        mm=re.match(r'^([A-Z0-9&\-\_]+)',s.upper())
+        if mm and len(mm.group(1))>=3: u.add(mm.group(1))
     return list(u)
 def best_underlying(base,us):
     base=base.upper()
@@ -260,7 +259,7 @@ def option_flow(s,om,z,us):
 def stars(s): return "★★★★★" if s>=90 else "★★★★☆" if s>=80 else "★★★☆☆" if s>=70 else "★★☆☆☆"
 
 def main():
-    print(f"=== DIVINE V8.3 FIXED | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
+    print(f"=== DIVINE V8.4 VOL-FIX | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
     s=login()
     m=master()
     em=equity_master(m).head(TOP_UNIVERSE)
@@ -269,13 +268,20 @@ def main():
     mbias,mval=market_bias(s)
     print(f"MARKET {mbias} {mval}",flush=True)
 
-    # STEP 1: QUOTES FIRST - NO CANDLE
     qdf=quotes(s,em["token"].tolist())
+    print(f"Quotes received: {len(qdf)}",flush=True)
     if qdf.empty:
-        print("Quotes empty"); tg("Quotes empty"); return
+        print("Quotes empty - Market closed?",flush=True)
+        tg("Quotes empty - Market closed")
+        return
+
     token_map={}
     for r in qdf.to_dict("records"):
-        try: token_map[str(r.get("symbolToken"))]=(float(r.get("ltp") or 0), float(r.get("volume") or 0))
+        try:
+            tok=str(r.get("symbolToken") or r.get("token") or "")
+            ltp=float(r.get("ltp") or r.get("last") or r.get("close") or 0)
+            vol=float(r.get("volume") or r.get("tradeVolume") or r.get("vol") or 0)
+            token_map[tok]=(ltp,vol)
         except: pass
 
     filtered=[]
@@ -284,13 +290,27 @@ def main():
         if sym.replace("-EQ","").upper() in IPO_BLOCK: continue
         if tok not in token_map: continue
         ltp,vol=token_map[tok]
-        if ltp>=MIN_PRICE and vol>=MIN_VOL: filtered.append((sym,tok,ltp,vol))
+        if ltp>=MIN_PRICE and vol>=MIN_VOL:
+            filtered.append((sym,tok,ltp,vol))
 
-    # sort by volume desc and take top INTRADAY_UNIVERSE
-    filtered=sorted(filtered,key=lambda x:x[3],reverse=True)[:INTRADAY_UNIVERSE]
-    print(f"After filter {len(filtered)} stocks",flush=True)
+    print(f"After price/vol filter {MIN_PRICE}/{MIN_VOL}: {len(filtered)}",flush=True)
+
     if not filtered:
-        tg(f"No stock after price/vol filter | Market {mbias}"); return
+        print(f"Volume filter too strict, trying only price filter",flush=True)
+        for _,row in em.iterrows():
+            tok=row["token"]; sym=row["symbol"]
+            if tok not in token_map: continue
+            ltp,vol=token_map[tok]
+            if ltp>=MIN_PRICE:
+                filtered.append((sym,tok,ltp,vol))
+        print(f"After price-only filter: {len(filtered)}",flush=True)
+
+    filtered=sorted(filtered,key=lambda x:x[3],reverse=True)[:INTRADAY_UNIVERSE]
+    print(f"Final universe {len(filtered)}",flush=True)
+
+    if not filtered:
+        msg=f"No stock after filter | Market {mbias}"
+        print(msg,flush=True); tg(msg); return
 
     results=[]
     for sym,tok,ltp,vol in filtered:
@@ -300,7 +320,8 @@ def main():
         time.sleep(0.2)
 
     if not results:
-        print("No setups"); tg(f"DIVINE {datetime.now(IST):%d %b %H:%M} | No setup | Market {mbias}"); return
+        msg=f"DIVINE {datetime.now(IST):%d %b %H:%M} | No setup | Market {mbias}"
+        print(msg,flush=True); tg(msg); return
 
     results=sorted(results,key=lambda x:x["tech"],reverse=True)[:TOP_SIGNALS]
     final_msgs=[]
@@ -316,6 +337,7 @@ def main():
         text="\n\n".join(final_msgs)
         print(text,flush=True); tg(text)
     else:
-        print("Filtered by MIN_SCORE"); tg(f"No high score | Market {mbias}")
+        msg=f"No high score | Market {mbias}"
+        print(msg,flush=True); tg(msg)
 
 if __name__=="__main__": main()
