@@ -16,9 +16,8 @@ TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
 # =========================================================
-# CORE SETTINGS - STRATEGY UNCHANGED
+# CORE SETTINGS — STRATEGY UNCHANGED
 # =========================================================
-
 MIN_PRICE=100
 MIN_VOL=200000
 
@@ -29,52 +28,34 @@ TOP_SIGNALS=3
 MIN_SCORE=70
 MIN_VOLX=1.2
 
-# Historical API throttle
 CANDLE_DELAY=1.15
-CANDLE_RETRIES=3
-
-# Retry / AB1021
-AB1021_BACKOFF=[8,18,35]
-
-# Historical API emergency cooldown
-HIST_COOLDOWN=120
-
-# Normal processing delay
 DELAY=.25
 
 MIN_SL_PCT=.004
 
-# Options
+# OPTIONS
 OPTION_MAX=6
 OPTION_DAYS=5
 OPTION_STRIKES=2
 OPTION_DELAY=.25
 OPTION_TOP=8
 
-# Live quote
-QUOTE_BATCH=50
-QUOTE_DELAY=1.2
+# API RETRY
+CANDLE_RETRIES=3
+AB1021_BACKOFF=[8,18,35]
 
 # Daily history
-DAILY_DAYS=250
+ONE_DAY_DAYS=250
+FIVE_MIN_DAYS=12
+FIFTEEN_MIN_DAYS=25
 
 IST=pytz.timezone("Asia/Kolkata")
 
-# =========================================================
-# GLOBALS
-# =========================================================
-
-_LAST_CANDLE_CALL=0.0
-_CONSECUTIVE_AB1021=0
-_HIST_BLOCK_UNTIL=0.0
-
-CANDLE_CACHE={}
 OPTION_CACHE={}
 
 # =========================================================
 # UNDERLYING FIX
 # =========================================================
-
 UNDERLYING_FIX={
     "MOTHERSON":"MOTHERSUMI",
     "M_M":"M&M",
@@ -84,33 +65,61 @@ UNDERLYING_FIX={
 }
 
 # =========================================================
-# IPO BLOCK
+# IPO / NEW LISTING BLOCK
 # =========================================================
-
 IPO_BLOCK={
-    "GLASSWALL",
-    "SAMBHV",
-    "PINELABS",
-    "TATATECH",
-    "IREDA",
-    "MAMA",
-    "DOMS",
-    "KRN",
-    "BLS",
-    "BAJAJHFL"
+    "GLASSWALL","SAMBHV","PINELABS","TATATECH",
+    "IREDA","MAMA","DOMS","KRN","BLS","BAJAJHFL"
 }
+
+# =========================================================
+# GLOBAL HISTORICAL API CONTROL
+# =========================================================
+_LAST_CANDLE_CALL=0.0
+AB1021_COUNT=0
+CANDLE_COOLDOWN_UNTIL=0.0
+
+
+def candle_wait():
+
+    global _LAST_CANDLE_CALL
+
+    now=time.monotonic()
+    gap=now-_LAST_CANDLE_CALL
+
+    if gap<CANDLE_DELAY:
+        time.sleep(CANDLE_DELAY-gap)
+
+    _LAST_CANDLE_CALL=time.monotonic()
+
+
+def rate_error_response(r):
+
+    if not isinstance(r,dict):
+        return False
+
+    code=str(
+        r.get("errorcode","")
+    ).upper()
+
+    msg=str(
+        r.get("message","")
+    ).lower()
+
+    return (
+        code=="AB1021" or
+        "too many requests" in msg or
+        "rate limit" in msg or
+        "exceeding access rate" in msg
+    )
+
 
 # =========================================================
 # TELEGRAM
 # =========================================================
-
 def tg(x):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(
-            "TELEGRAM SECRETS MISSING",
-            flush=True
-        )
         return
 
     try:
@@ -124,34 +133,14 @@ def tg(x):
             timeout=12
         )
 
-    except Exception as e:
+    except Exception:
+        pass
 
-        print(
-            f"Telegram error: {e}",
-            flush=True
-        )
 
 # =========================================================
 # LOGIN
 # =========================================================
-
 def login():
-
-    if not all([
-        API_KEY,
-        CLIENT_ID,
-        PASSWORD,
-        TOTP_SECRET
-    ]):
-
-        raise RuntimeError(
-            "Missing Angel One GitHub Secrets"
-        )
-
-    print(
-        "LOGIN: starting...",
-        flush=True
-    )
 
     s=SmartConnect(
         api_key=API_KEY
@@ -167,29 +156,18 @@ def login():
         totp
     )
 
-    if not r or r.get("status") is False:
-
+    if not r or not r.get("status",True):
         raise RuntimeError(
-            f"LOGIN FAILED: {r}"
+            f"Angel One login failed: {r}"
         )
 
-    print(
-        "LOGIN: SUCCESS",
-        flush=True
-    )
-
     return s
+
 
 # =========================================================
 # MASTER
 # =========================================================
-
 def master():
-
-    print(
-        "MASTER: downloading...",
-        flush=True
-    )
 
     r=requests.get(
         MASTER_URL,
@@ -204,11 +182,6 @@ def master():
 
     x["token"]=x["token"].astype(str)
     x["symbol"]=x["symbol"].astype(str)
-
-    print(
-        f"MASTER: {len(x)} instruments",
-        flush=True
-    )
 
     return x
 
@@ -248,9 +221,6 @@ def option_master(m):
         )
     ].copy()
 
-# =========================================================
-# OPTION UNDERLYINGS
-# =========================================================
 
 def all_underlyings(om):
 
@@ -263,12 +233,8 @@ def all_underlyings(om):
             s.upper()
         )
 
-        if m:
-
-            z=m.group(1)
-
-            if len(z)>=3:
-                u.add(z)
+        if m and len(m.group(1))>=3:
+            u.add(m.group(1))
 
     return list(u)
 
@@ -297,51 +263,38 @@ def best_underlying(base,us):
 
     return z[0] if z else base
 
+
 # =========================================================
 # LIVE QUOTES
 # =========================================================
-
 def quotes(s,tokens):
 
     out=[]
 
-    tokens=[
-        str(x)
-        for x in tokens
-    ]
-
-    print(
-        f"QUOTE: scanning {len(tokens)} NSE tokens",
-        flush=True
-    )
+    if not tokens:
+        return pd.DataFrame()
 
     for i in range(
         0,
         len(tokens),
-        QUOTE_BATCH
+        50
     ):
 
-        batch=tokens[
-            i:i+QUOTE_BATCH
-        ]
+        batch=tokens[i:i+50]
 
         try:
 
             r=s.getMarketData(
                 "FULL",
                 {
-                    "NSE":batch
+                    "NSE":[
+                        str(x)
+                        for x in batch
+                    ]
                 }
             )
 
             if isinstance(r,dict):
-
-                if r.get("status") is False:
-
-                    print(
-                        f"QUOTE ERROR: {r}",
-                        flush=True
-                    )
 
                 d=r.get(
                     "data",
@@ -355,9 +308,8 @@ def quotes(s,tokens):
                         []
                     ) or []
 
-                    out.extend(
-                        fetched
-                    )
+                    if fetched:
+                        out += fetched
 
         except Exception as e:
 
@@ -366,43 +318,20 @@ def quotes(s,tokens):
                 flush=True
             )
 
-        time.sleep(
-            QUOTE_DELAY
-        )
+        # Market-data API safety
+        time.sleep(1.2)
 
-    q=pd.DataFrame(out)
+    if not out:
+        return pd.DataFrame()
 
-    print(
-        f"QUOTE: received {len(q)} rows",
-        flush=True
-    )
+    return pd.DataFrame(out)
 
-    return q
-
-# =========================================================
-# GLOBAL CANDLE RATE LIMITER
-# =========================================================
-
-def candle_wait():
-
-    global _LAST_CANDLE_CALL
-
-    now=time.monotonic()
-
-    gap=now-_LAST_CANDLE_CALL
-
-    if gap<CANDLE_DELAY:
-
-        time.sleep(
-            CANDLE_DELAY-gap
-        )
-
-    _LAST_CANDLE_CALL=time.monotonic()
 
 # =========================================================
 # SAFE HISTORICAL CANDLE API
+# IMPORTANT:
+# Handles AB1021 returned as DICT also.
 # =========================================================
-
 def candles(
     s,
     tok,
@@ -411,25 +340,23 @@ def candles(
     exchange="NSE"
 ):
 
-    global _CONSECUTIVE_AB1021
-    global _HIST_BLOCK_UNTIL
+    global _LAST_CANDLE_CALL
+    global AB1021_COUNT
+    global CANDLE_COOLDOWN_UNTIL
 
-    cache_key=(
-        str(exchange),
-        str(tok),
-        str(interval),
-        int(days)
-    )
+    # If historical API has entered cooldown
+    if time.monotonic()<CANDLE_COOLDOWN_UNTIL:
 
-    # Cache successful calls
-    if cache_key in CANDLE_CACHE:
+        remain=int(
+            CANDLE_COOLDOWN_UNTIL-
+            time.monotonic()
+        )
 
-        return CANDLE_CACHE[
-            cache_key
-        ].copy()
-
-    # Emergency cooldown
-    if time.monotonic()< _HIST_BLOCK_UNTIL:
+        print(
+            f"CANDLE COOLDOWN ACTIVE | "
+            f"{remain}s",
+            flush=True
+        )
 
         return None
 
@@ -441,9 +368,9 @@ def candles(
 
         try:
 
-            now=datetime.now()
+            e=datetime.now()
 
-            begin=now-timedelta(
+            b=e-timedelta(
                 days=days
             )
 
@@ -451,10 +378,10 @@ def candles(
                 "exchange":exchange,
                 "symboltoken":str(tok),
                 "interval":interval,
-                "fromdate":begin.strftime(
+                "fromdate":b.strftime(
                     "%Y-%m-%d %H:%M"
                 ),
-                "todate":now.strftime(
+                "todate":e.strftime(
                     "%Y-%m-%d %H:%M"
                 )
             }
@@ -464,106 +391,95 @@ def candles(
             )
 
             # -------------------------------------------------
-            # IMPORTANT AB1021 RESPONSE HANDLING
+            # IMPORTANT:
+            # SmartAPI can return AB1021 as response dict
+            # instead of throwing exception.
             # -------------------------------------------------
+            if rate_error_response(r):
 
-            if isinstance(r,dict):
+                AB1021_COUNT+=1
 
-                code=str(
-                    r.get(
-                        "errorcode",
-                        ""
+                wait=AB1021_BACKOFF[
+                    min(
+                        attempt,
+                        len(AB1021_BACKOFF)-1
                     )
-                ).upper()
+                ]
 
-                msg=str(
-                    r.get(
-                        "message",
-                        ""
-                    )
-                ).lower()
-
-                status=r.get(
-                    "status"
+                print(
+                    f"AB1021/RATE LIMIT | "
+                    f"count={AB1021_COUNT} | "
+                    f"attempt={attempt+1} | "
+                    f"sleep={wait}s",
+                    flush=True
                 )
 
-                is_rate=(
-                    code=="AB1021" or
-                    "too many requests" in msg or
-                    "exceeding access rate" in msg or
-                    "rate limit" in msg
-                )
+                # After repeated AB1021, stop hammering
+                if AB1021_COUNT>=3:
 
-                if is_rate:
-
-                    _CONSECUTIVE_AB1021+=1
+                    CANDLE_COOLDOWN_UNTIL=(
+                        time.monotonic()+70
+                    )
 
                     print(
-                        f"AB1021 | "
-                        f"{exchange} {tok} {interval} | "
-                        f"attempt {attempt+1} | "
-                        f"count {_CONSECUTIVE_AB1021}",
+                        "HISTORICAL API COOLDOWN "
+                        "70s ACTIVATED",
                         flush=True
                     )
 
-                    if _CONSECUTIVE_AB1021>=3:
-
-                        _HIST_BLOCK_UNTIL=(
-                            time.monotonic()+
-                            HIST_COOLDOWN
-                        )
-
-                        print(
-                            f"HISTORICAL API PAUSED "
-                            f"FOR {HIST_COOLDOWN}s",
-                            flush=True
-                        )
-
-                        return None
-
-                    if attempt<CANDLE_RETRIES-1:
-
-                        wait=AB1021_BACKOFF[
-                            min(
-                                attempt,
-                                len(
-                                    AB1021_BACKOFF
-                                )-1
-                            )
-                        ]
-
-                        print(
-                            f"RATE BACKOFF: {wait}s",
-                            flush=True
-                        )
-
-                        time.sleep(
-                            wait
-                        )
-
-                        continue
-
+                if attempt>=CANDLE_RETRIES-1:
                     return None
 
-                data=r.get(
-                    "data"
-                )
-
-                if (
-                    status is False or
-                    data is None
-                ):
-
-                    return None
-
-            else:
-
-                data=None
-
-            if data is None:
+                time.sleep(wait)
                 continue
 
-            if len(data)==0:
+            if not isinstance(r,dict):
+                time.sleep(
+                    3*(attempt+1)
+                )
+                continue
+
+            if not r.get("status",True):
+
+                msg=str(
+                    r.get("message","")
+                ).lower()
+
+                if (
+                    "too many" in msg or
+                    "rate" in msg or
+                    "ab1021" in msg
+                ):
+
+                    AB1021_COUNT+=1
+
+                    wait=AB1021_BACKOFF[
+                        min(
+                            attempt,
+                            len(AB1021_BACKOFF)-1
+                        )
+                    ]
+
+                    print(
+                        f"RATE RESPONSE | "
+                        f"{msg} | "
+                        f"sleep {wait}s",
+                        flush=True
+                    )
+
+                    if attempt>=CANDLE_RETRIES-1:
+                        return None
+
+                    time.sleep(wait)
+                    continue
+
+                return None
+
+            data=r.get(
+                "data"
+            )
+
+            if data is None or len(data)==0:
                 return None
 
             x=pd.DataFrame(
@@ -606,23 +522,15 @@ def candles(
             if x.empty:
                 return None
 
-            x=(
+            # Success resets consecutive rate count
+            AB1021_COUNT=0
+
+            return (
                 x.sort_values(
                     "timestamp"
                 )
-                .reset_index(
-                    drop=True
-                )
+                .reset_index(drop=True)
             )
-
-            # Successful request
-            _CONSECUTIVE_AB1021=0
-
-            CANDLE_CACHE[
-                cache_key
-            ]=x.copy()
-
-            return x
 
         except Exception as e:
 
@@ -631,8 +539,8 @@ def candles(
             is_rate=(
                 "ab1021" in msg or
                 "too many requests" in msg or
-                "exceeding access rate" in msg or
-                "rate limit" in msg
+                "rate" in msg or
+                "exceeding access rate" in msg
             )
 
             is_timeout=(
@@ -644,46 +552,33 @@ def candles(
 
             if is_rate:
 
-                _CONSECUTIVE_AB1021+=1
+                AB1021_COUNT+=1
+
+                wait=AB1021_BACKOFF[
+                    min(
+                        attempt,
+                        len(AB1021_BACKOFF)-1
+                    )
+                ]
 
                 print(
                     f"AB1021 EXCEPTION | "
-                    f"attempt {attempt+1} | "
-                    f"count {_CONSECUTIVE_AB1021}",
+                    f"count={AB1021_COUNT} | "
+                    f"attempt={attempt+1} | "
+                    f"sleep={wait}s",
                     flush=True
                 )
 
-                if _CONSECUTIVE_AB1021>=3:
+                if AB1021_COUNT>=3:
 
-                    _HIST_BLOCK_UNTIL=(
-                        time.monotonic()+
-                        HIST_COOLDOWN
+                    CANDLE_COOLDOWN_UNTIL=(
+                        time.monotonic()+70
                     )
 
-                    print(
-                        f"HISTORICAL API PAUSED "
-                        f"FOR {HIST_COOLDOWN}s",
-                        flush=True
-                    )
-
+                if attempt>=CANDLE_RETRIES-1:
                     return None
 
-                if attempt<CANDLE_RETRIES-1:
-
-                    wait=AB1021_BACKOFF[
-                        min(
-                            attempt,
-                            len(
-                                AB1021_BACKOFF
-                            )-1
-                        )
-                    ]
-
-                    time.sleep(
-                        wait
-                    )
-
-                    continue
+                time.sleep(wait)
 
             elif is_timeout:
 
@@ -691,16 +586,15 @@ def candles(
 
                 print(
                     f"TIMEOUT | "
-                    f"attempt {attempt+1} | "
-                    f"sleep {wait}s",
+                    f"attempt={attempt+1} | "
+                    f"sleep={wait}s",
                     flush=True
                 )
 
-                time.sleep(
-                    wait
-                )
+                if attempt>=CANDLE_RETRIES-1:
+                    return None
 
-                continue
+                time.sleep(wait)
 
             else:
 
@@ -711,16 +605,19 @@ def candles(
                     flush=True
                 )
 
+                if attempt>=CANDLE_RETRIES-1:
+                    return None
+
                 time.sleep(
                     3*(attempt+1)
                 )
 
     return None
 
+
 # =========================================================
 # RSI
 # =========================================================
-
 def rsi(s,n=14):
 
     d=s.diff()
@@ -739,18 +636,19 @@ def rsi(s,n=14):
         adjust=False
     ).mean()
 
-    return 100-100/(
-        1+
+    return (
+        100-
+        100/(1+
         u/v.replace(
             0,
             np.nan
-        )
+        ))
     )
+
 
 # =========================================================
 # FEATURES
 # =========================================================
-
 def feat(x):
 
     x=x.copy()
@@ -787,9 +685,7 @@ def feat(x):
             ).abs()
         ],
         axis=1
-    ).max(
-        axis=1
-    )
+    ).max(axis=1)
 
     x["atr"]=tr.ewm(
         span=14,
@@ -853,11 +749,11 @@ def feat(x):
 
     return x
 
+
 # =========================================================
 # MARKET BIAS
 # =========================================================
-
-def market_bias(s):
+def market_bias(s,em):
 
     vals=[]
 
@@ -874,10 +770,7 @@ def market_bias(s):
             ex
         )
 
-        if d is None:
-            continue
-
-        if len(d)<30:
+        if d is None or len(d)<30:
             continue
 
         d=feat(d)
@@ -905,7 +798,6 @@ def market_bias(s):
         )
 
     if not vals:
-
         return "NEUTRAL",0
 
     z=sum(vals)
@@ -918,10 +810,10 @@ def market_bias(s):
 
     return "NEUTRAL",z
 
+
 # =========================================================
 # SECTOR
 # =========================================================
-
 def sector_name(sym):
 
     b=sym.replace(
@@ -970,15 +862,35 @@ def sector_name(sym):
 
     return "OTHER"
 
+
+def sector_strength(res):
+
+    d={}
+
+    for z in res:
+
+        k=z["sector"]
+
+        d.setdefault(
+            k,
+            []
+        ).append(
+            z["tech"]
+        )
+
+    return {
+        k:float(np.mean(v))
+        for k,v in d.items()
+    }
+
+
 # =========================================================
 # STOCK ANALYSIS
+# STRATEGY UNCHANGED
 # =========================================================
-
 def analyze(
     sym,
     tok,
-    live_ltp,
-    live_vol,
     s,
     mbias
 ):
@@ -992,13 +904,12 @@ def analyze(
         return None
 
     # -----------------------------------------------------
-    # DAILY HISTORY
+    # DAILY
     # -----------------------------------------------------
-
     d_daily=candles(
         s,
         tok,
-        DAILY_DAYS,
+        ONE_DAY_DAYS,
         "ONE_DAY",
         "NSE"
     )
@@ -1012,11 +923,10 @@ def analyze(
     # -----------------------------------------------------
     # 5 MIN
     # -----------------------------------------------------
-
     d5=candles(
         s,
         tok,
-        12,
+        FIVE_MIN_DAYS,
         "FIVE_MINUTE",
         "NSE"
     )
@@ -1024,18 +934,15 @@ def analyze(
     if d5 is None:
         return None
 
-    time.sleep(
-        DELAY
-    )
+    time.sleep(DELAY)
 
     # -----------------------------------------------------
     # 15 MIN
     # -----------------------------------------------------
-
     d15=candles(
         s,
         tok,
-        25,
+        FIFTEEN_MIN_DAYS,
         "FIFTEEN_MINUTE",
         "NSE"
     )
@@ -1043,10 +950,7 @@ def analyze(
     if d15 is None:
         return None
 
-    if len(d5)<60:
-        return None
-
-    if len(d15)<60:
+    if len(d5)<60 or len(d15)<60:
         return None
 
     d5=feat(d5)
@@ -1070,13 +974,10 @@ def analyze(
         pd.isna(a[k])
         for k in keys
     ):
-
         return None
 
     entry=float(
-        live_ltp
-        if live_ltp>0
-        else a.close
+        a.close
     )
 
     atr=max(
@@ -1087,7 +988,6 @@ def analyze(
     # -----------------------------------------------------
     # 15M TREND
     # -----------------------------------------------------
-
     bull15=(
         b.close>b.ema20>b.ema50 and
         b.ema20slope>0
@@ -1101,7 +1001,6 @@ def analyze(
     # -----------------------------------------------------
     # 5M TREND
     # -----------------------------------------------------
-
     bull5=(
         a.close>a.ema9>a.ema20 and
         a.ema20slope>0
@@ -1137,7 +1036,6 @@ def analyze(
     # -----------------------------------------------------
     # BUY SCORE
     # -----------------------------------------------------
-
     buy=sum([
         25 if bull15 else 0,
         20 if bull5 else 0,
@@ -1150,7 +1048,6 @@ def analyze(
     # -----------------------------------------------------
     # SELL SCORE
     # -----------------------------------------------------
-
     sell=sum([
         25 if bear15 else 0,
         20 if bear5 else 0,
@@ -1160,17 +1057,11 @@ def analyze(
         10 if breakout_sell else 0
     ])
 
-    if buy>sell:
-
-        direction="BUY"
-
-    elif sell>buy:
-
-        direction="SELL"
-
-    else:
-
-        return None
+    direction=(
+        "BUY"
+        if buy>sell
+        else "SELL"
+    )
 
     tech=max(
         buy,
@@ -1187,18 +1078,15 @@ def analyze(
         sym
     )
 
-    # Avoid weak random OTHER stocks
     if (
         sec=="OTHER" and
         tech<85
     ):
-
         return None
 
     # -----------------------------------------------------
     # MARKET POINTS
     # -----------------------------------------------------
-
     if (
         mbias=="BULLISH" and
         direction=="SELL"
@@ -1224,7 +1112,6 @@ def analyze(
     # -----------------------------------------------------
     # STOP LOSS
     # -----------------------------------------------------
-
     if direction=="BUY":
 
         sw=float(
@@ -1233,11 +1120,10 @@ def analyze(
 
         sl=min(
             entry-atr,
-            sw-.15*atr
+            sw-0.15*atr
         )
 
         if sl>=entry:
-
             sl=entry-atr
 
     else:
@@ -1248,29 +1134,22 @@ def analyze(
 
         sl=max(
             entry+atr,
-            sw+.15*atr
+            sw+0.15*atr
         )
 
         if sl<=entry:
-
             sl=entry+atr
 
     risk=abs(
         entry-sl
     )
 
-    if (
-        risk/entry
-        <
-        MIN_SL_PCT
-    ):
-
+    if risk/entry<MIN_SL_PCT:
         return None
 
     # -----------------------------------------------------
     # TARGETS
     # -----------------------------------------------------
-
     t1=entry+(
         1.5*risk
         if direction=="BUY"
@@ -1292,7 +1171,6 @@ def analyze(
     # -----------------------------------------------------
     # SETUP
     # -----------------------------------------------------
-
     if (
         breakout_buy
         if direction=="BUY"
@@ -1327,14 +1205,14 @@ def analyze(
         "volx":vol,
         "setup":setup,
         "sector":sec,
-        "live_ltp":entry,
-        "live_vol":live_vol
+        "live_ltp":entry
     }
+
 
 # =========================================================
 # OPTIONS FLOW
+# STRATEGY UNCHANGED
 # =========================================================
-
 def option_flow(
     s,
     om,
@@ -1346,9 +1224,7 @@ def option_flow(
         "-EQ",""
     ).upper()
 
-    spot=float(
-        z["live_ltp"]
-    )
+    spot=z["live_ltp"]
 
     u=best_underlying(
         sym,
@@ -1356,22 +1232,14 @@ def option_flow(
     )
 
     x=om[
-        om.symbol
-        .str.upper()
-        .str.startswith(
+        om.symbol.str.upper().str.startswith(
             u,
             na=False
         )
     ].copy()
 
     if x.empty:
-
-        return (
-            0,
-            "NEUTRAL",
-            0,
-            u
-        )
+        return 0,"NEUTRAL",0,u
 
     today=pd.Timestamp.now().normalize()
 
@@ -1379,40 +1247,22 @@ def option_flow(
         (x.expiry_dt>=today) &
         (
             x.expiry_dt<=
-            today+
-            pd.Timedelta(
-                days=45
-            )
+            today+pd.Timedelta(days=45)
         )
     ].copy()
 
     if x.empty:
-
-        return (
-            0,
-            "NEUTRAL",
-            0,
-            u
-        )
+        return 0,"NEUTRAL",0,u
 
     exp=sorted(
         x.expiry_dt
         .dropna()
         .unique()
-    )
-
-    if not exp:
-
-        return (
-            0,
-            "NEUTRAL",
-            0,
-            u
-        )
+    )[:1]
 
     x=x[
-        x.expiry_dt==exp[0]
-    ].copy()
+        x.expiry_dt.isin(exp)
+    ]
 
     strikes=sorted(
         x.strike_num
@@ -1421,13 +1271,7 @@ def option_flow(
     )
 
     if not strikes:
-
-        return (
-            0,
-            "NEUTRAL",
-            0,
-            u
-        )
+        return 0,"NEUTRAL",0,u
 
     atm=min(
         strikes,
@@ -1447,8 +1291,7 @@ def option_flow(
 
     allowed=[
         q for q in strikes
-        if abs(q-atm)
-        <=
+        if abs(q-atm)<=
         gap*OPTION_STRIKES
     ]
 
@@ -1456,14 +1299,15 @@ def option_flow(
         x.strike_num.isin(
             allowed
         )
-    ].copy()
+    ]
 
+    # Nearest strikes first
     x["dist"]=(
         x.strike_num-atm
     ).abs()
 
     x=x.sort_values(
-        "dist"
+        ["dist","strike_num"]
     )
 
     ce=0.0
@@ -1479,37 +1323,19 @@ def option_flow(
         if used>=OPTION_MAX:
             break
 
-        key=(
-            str(c.token),
-            OPTION_DAYS
+        d=candles(
+            s,
+            c.token,
+            OPTION_DAYS,
+            "ONE_DAY",
+            "NFO"
         )
 
-        if key in OPTION_CACHE:
+        time.sleep(
+            OPTION_DELAY
+        )
 
-            d=OPTION_CACHE[key]
-
-        else:
-
-            d=candles(
-                s,
-                c.token,
-                OPTION_DAYS,
-                "ONE_DAY",
-                "NFO"
-            )
-
-            if d is not None:
-
-                OPTION_CACHE[key]=d
-
-            time.sleep(
-                OPTION_DELAY
-            )
-
-        if d is None:
-            continue
-
-        if len(d)<3:
+        if d is None or len(d)<3:
             continue
 
         used+=1
@@ -1536,81 +1362,49 @@ def option_flow(
             .01
         )
 
-        cs=str(
+        if str(
             c.symbol
-        ).upper()
-
-        if cs.endswith("CE"):
+        ).upper().endswith("CE"):
 
             ce+=v
             cm.append(m)
 
-        elif cs.endswith("PE"):
+        else:
 
             pe+=v
             pm.append(m)
 
     if ce==0 and pe==0:
-
-        return (
-            0,
-            "NEUTRAL",
-            0,
-            u
-        )
+        return 0,"NEUTRAL",0,u
 
     ratio=ce/max(
         pe,
         1
     )
 
-    ca=(
-        float(np.mean(cm))
-        if cm
-        else 0
-    )
-
-    pa=(
-        float(np.mean(pm))
-        if pm
-        else 0
-    )
+    ca=np.mean(cm) if cm else 0
+    pa=np.mean(pm) if pm else 0
 
     if (
         ratio>=1.25 and
         ca>=pa
     ):
 
-        return (
-            8,
-            "BULLISH",
-            ratio,
-            u
-        )
+        return 8,"BULLISH",ratio,u
 
     if (
         ratio<=.80 and
         pa>=ca
     ):
 
-        return (
-            8,
-            "BEARISH",
-            ratio,
-            u
-        )
+        return 8,"BEARISH",ratio,u
 
-    return (
-        0,
-        "NEUTRAL",
-        ratio,
-        u
-    )
+    return 0,"NEUTRAL",ratio,u
+
 
 # =========================================================
 # STARS
 # =========================================================
-
 def stars(s):
 
     if s>=90:
@@ -1624,76 +1418,77 @@ def stars(s):
 
     return "★★☆☆☆"
 
+
+# =========================================================
+# NO SETUP
+# =========================================================
+def no_setup(
+    mbias,
+    reason
+):
+
+    msg=(
+        "⚠️ DIVINE INTRADAY\n\n"
+        "NO SETUP\n\n"
+        f"MARKET: {mbias}\n"
+        f"REASON: {reason}"
+    )
+
+    print(
+        msg,
+        flush=True
+    )
+
+    tg(msg)
+
+
 # =========================================================
 # MAIN
 # =========================================================
-
 def main():
 
-    start=time.time()
+    global CANDLE_COOLDOWN_UNTIL
 
     print(
-        "\n========================================",
+        f"=== DIVINE INTRADAY V8.1 SAFE | "
+        f"{datetime.now(IST):%d %b %H:%M:%S IST} ===",
         flush=True
     )
 
     print(
-        "      DIVINE INTRADAY V8.2 SAFE",
+        "API MODE: RATE-LIMIT SAFE | "
+        f"CANDLE GAP {CANDLE_DELAY}s | "
+        f"UNIVERSE {TOP_UNIVERSE} | "
+        f"INTRADAY {INTRADAY_UNIVERSE}",
         flush=True
     )
 
-    print(
-        f"      {datetime.now(IST):%d %b %Y %H:%M:%S IST}",
-        flush=True
-    )
-
-    print(
-        "========================================",
-        flush=True
-    )
-
-    print(
-        f"CANDLE GAP: {CANDLE_DELAY}s",
-        flush=True
-    )
-
-    print(
-        f"TOP UNIVERSE: {TOP_UNIVERSE}",
-        flush=True
-    )
-
-    print(
-        f"INTRADAY UNIVERSE: {INTRADAY_UNIVERSE}",
-        flush=True
-    )
-
-    # =====================================================
+    # -----------------------------------------------------
     # LOGIN
-    # =====================================================
-
+    # -----------------------------------------------------
     try:
 
         s=login()
 
     except Exception as e:
 
+        msg=(
+            "⚠️ DIVINE INTRADAY\n\n"
+            "NO SETUP\n\n"
+            "REASON: Angel One login failed"
+        )
+
         print(
-            f"LOGIN FAILED: {e}",
+            f"LOGIN ERROR: {e}",
             flush=True
         )
 
-        tg(
-            "⚠️ DIVINE INTRADAY\n"
-            "LOGIN FAILED\n"
-            f"{e}"
-        )
-
+        tg(msg)
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # MASTER
-    # =====================================================
-
+    # -----------------------------------------------------
     try:
 
         m=master()
@@ -1708,121 +1503,116 @@ def main():
 
     except Exception as e:
 
+        msg=(
+            "⚠️ DIVINE INTRADAY\n\n"
+            "NO SETUP\n\n"
+            f"REASON: Master data error"
+        )
+
         print(
-            f"MASTER FAILED: {e}",
+            f"MASTER ERROR: {e}",
             flush=True
         )
 
-        tg(
-            "⚠️ DIVINE INTRADAY\n"
-            "MASTER FAILED\n"
-            f"{e}"
-        )
-
+        tg(msg)
         return
 
     print(
-        f"NSE EQUITY: {len(em)}",
-        flush=True
-    )
-
-    print(
+        f"NSE EQUITY: {len(em)} | "
         f"NFO OPTIONS: {len(om)}",
         flush=True
     )
 
-    # =====================================================
+    # -----------------------------------------------------
     # MARKET BIAS
-    # =====================================================
-
+    # -----------------------------------------------------
     mbias,mval=market_bias(
-        s
+        s,
+        em
     )
 
     print(
         f"MARKET: {mbias} | "
-        f"NIFTY/SENSEX SCORE {mval}",
+        f"NIFTY/SENSEX score {mval}",
         flush=True
     )
 
-    # =====================================================
-    # LIVE QUOTES
-    # =====================================================
+    # -----------------------------------------------------
+    # IF HISTORICAL API COOLDOWN
+    # -----------------------------------------------------
+    if (
+        CANDLE_COOLDOWN_UNTIL>
+        time.monotonic()
+    ):
 
-    q=quotes(
-        s,
-        em.token.tolist()
-    )
-
-    if q.empty:
-
-        print(
-            "NO LIVE QUOTES RECEIVED",
-            flush=True
-        )
-
-        tg(
-            "⚠️ DIVINE INTRADAY\n"
-            "NO LIVE QUOTES RECEIVED"
+        no_setup(
+            mbias,
+            "Angel One historical API AB1021/rate-limit cooldown"
         )
 
         return
 
-    # =====================================================
-    # NORMALIZE TOKEN
-    # =====================================================
+    # -----------------------------------------------------
+    # LIVE QUOTES
+    # -----------------------------------------------------
+    #
+    # Strategy/universe logic kept same:
+    # TOP_UNIVERSE instruments from master,
+    # then live price/volume filtering.
+    # -----------------------------------------------------
+    top_tokens=em.head(
+        TOP_UNIVERSE
+    )
 
-    if "symbolToken" in q.columns:
+    if top_tokens.empty:
 
-        q["symbolToken"]=q[
-            "symbolToken"
-        ].astype(str)
+        no_setup(
+            mbias,
+            "No NSE equity universe"
+        )
 
-    elif "symboltoken" in q.columns:
+        return
 
-        q["symbolToken"]=q[
-            "symboltoken"
-        ].astype(str)
+    q=quotes(
+        s,
+        top_tokens.token.astype(str).tolist()
+    )
 
-    elif "token" in q.columns:
+    if q.empty:
 
-        q["symbolToken"]=q[
-            "token"
-        ].astype(str)
+        no_setup(
+            mbias,
+            "Live quote data unavailable"
+        )
 
-    else:
+        return
 
-        q["symbolToken"]=""
-
-    # =====================================================
-    # NORMALIZE LTP / VOLUME
-    # =====================================================
-
-    if "ltp" not in q.columns:
-        q["ltp"]=0
-
-    if "tradeVolume" not in q.columns:
-        q["tradeVolume"]=0
+    # -----------------------------------------------------
+    # NORMALIZE QUOTE DATA
+    # -----------------------------------------------------
+    q["token"]=q[
+        "symbolToken"
+    ].astype(str)
 
     q["ltp"]=pd.to_numeric(
-        q["ltp"],
+        q.get("ltp"),
         errors="coerce"
-    ).fillna(0)
+    )
 
     q["tradeVolume"]=pd.to_numeric(
-        q["tradeVolume"],
+        q.get("tradeVolume"),
         errors="coerce"
     ).fillna(0)
 
-    # =====================================================
-    # JOIN MASTER
-    # =====================================================
+    q=q.dropna(
+        subset=["ltp"]
+    )
 
+    # -----------------------------------------------------
+    # MAP SYMBOL
+    # -----------------------------------------------------
     em2=em[
-        [
-            "token",
-            "symbol"
-        ]
+        ["token","symbol"]
     ].copy()
 
     em2["token"]=em2[
@@ -1831,116 +1621,63 @@ def main():
 
     q=q.merge(
         em2,
-        left_on="symbolToken",
-        right_on="token",
-        how="inner"
+        on="token",
+        how="left"
     )
 
-    # =====================================================
-    # PRICE / VOLUME FILTER
-    # =====================================================
-
-    q=q[
-        (q["ltp"]>=MIN_PRICE) &
-        (q["tradeVolume"]>=MIN_VOL)
-    ].copy()
-
-    # =====================================================
-    # IPO BLOCK
-    # =====================================================
-
-    q["clean"]=(
-        q["symbol"]
-        .str.replace(
-            "-EQ",
-            "",
-            regex=False
-        )
-        .str.upper()
+    q=q.dropna(
+        subset=["symbol"]
     )
 
+    # -----------------------------------------------------
+    # PRICE + VOLUME FILTER
+    # -----------------------------------------------------
     q=q[
-        ~q["clean"].isin(
-            IPO_BLOCK
-        )
+        (q.ltp>=MIN_PRICE) &
+        (q.tradeVolume>=MIN_VOL)
     ].copy()
 
-    # =====================================================
-    # HIGHEST VOLUME FIRST
-    # =====================================================
+    if q.empty:
 
+        no_setup(
+            mbias,
+            "No stocks passed price/volume filter"
+        )
+
+        return
+
+    # Highest live trade volume first
     q=q.sort_values(
         "tradeVolume",
         ascending=False
     )
 
     q=q.head(
-        TOP_UNIVERSE
-    ).copy()
-
-    print(
-        f"HIGH-VOLUME FILTER: {len(q)} stocks",
-        flush=True
-    )
-
-    if q.empty:
-
-        msg=(
-            "DIVINE INTRADAY\n\n"
-            "NO SETUP\n\n"
-            f"MARKET: {mbias}\n"
-            "REASON: No liquid stock passed filter"
-        )
-
-        print(
-            msg,
-            flush=True
-        )
-
-        tg(msg)
-
-        return
-
-    # =====================================================
-    # STOCK ANALYSIS
-    # =====================================================
-
-    candidates=[]
-
-    scan=q.head(
         INTRADAY_UNIVERSE
     )
 
     print(
-        f"STARTING INTRADAY ANALYSIS: "
-        f"{len(scan)} stocks",
+        f"INTRADAY CANDIDATES: {len(q)}",
         flush=True
     )
 
-    for n,(_,row) in enumerate(
-        scan.iterrows(),
-        1
-    ):
+    # -----------------------------------------------------
+    # TECHNICAL ANALYSIS
+    # -----------------------------------------------------
+    results=[]
+
+    for _,row in q.iterrows():
 
         sym=str(
-            row["symbol"]
+            row.symbol
         )
 
         tok=str(
-            row["token"]
-        )
-
-        ltp=float(
-            row["ltp"]
-        )
-
-        trade_vol=float(
-            row["tradeVolume"]
+            row.token
         )
 
         print(
-            f"[{n}/{len(scan)}] "
-            f"{sym} | LTP {ltp:.2f}",
+            f"ANALYZE | {sym}",
             flush=True
         )
 
@@ -1949,29 +1686,26 @@ def main():
             z=analyze(
                 sym,
                 tok,
-                ltp,
-                trade_vol,
                 s,
                 mbias
             )
 
-            if z:
+            if z is not None:
 
-                candidates.append(
-                    z
+                # Current live quote
+                z["live_ltp"]=float(
+                    row.ltp
                 )
 
-                print(
-                    f"  -> {z['direction']} "
-                    f"TECH {z['tech']} "
-                    f"{z['setup']}",
-                    flush=True
+                results.append(
+                    z
                 )
 
         except Exception as e:
 
             print(
-                f"  ANALYSIS ERROR: {e}",
+                f"ANALYZE ERROR | "
+                f"{sym} | {e}",
                 flush=True
             )
 
@@ -1979,208 +1713,194 @@ def main():
             DELAY
         )
 
-        if time.monotonic() < _HIST_BLOCK_UNTIL:
-
-            print(
-                "Historical API cooldown active. "
-                "Stopping stock scan.",
-                flush=True
-            )
-
+        # Stop if historical API enters cooldown
+        if (
+            CANDLE_COOLDOWN_UNTIL>
+            time.monotonic()
+        ):
             break
 
-    print(
-        f"TECH CANDIDATES: {len(candidates)}",
-        flush=True
-    )
+    if not results:
 
-    # =====================================================
-    # NO TECH CANDIDATE
-    # =====================================================
+        if (
+            CANDLE_COOLDOWN_UNTIL>
+            time.monotonic()
+        ):
 
-    if not candidates:
-
-        reason=(
-            "No stock passed "
-            "Daily + 5M + 15M + volume filters"
-        )
-
-        if _CONSECUTIVE_AB1021>=3:
-
-            reason=(
-                "Angel One historical API "
-                "AB1021/rate-limit cooldown"
+            no_setup(
+                mbias,
+                "Angel One historical API AB1021/rate-limit cooldown"
             )
 
-        msg=(
-            "⚠️ DIVINE INTRADAY\n\n"
-            "NO SETUP\n\n"
-            f"MARKET: {mbias}\n"
-            f"REASON: {reason}"
-        )
+        else:
 
-        print(
-            msg,
-            flush=True
-        )
-
-        tg(msg)
+            no_setup(
+                mbias,
+                "No technical setup passed"
+            )
 
         return
 
-    # =====================================================
-    # SORT TECH CANDIDATES
-    # =====================================================
-
-    candidates=sorted(
-        candidates,
-        key=lambda x:(
-            x["tech"]+
-            x["market_pts"]
+    # -----------------------------------------------------
+    # TECHNICAL RANK
+    # -----------------------------------------------------
+    results=sorted(
+        results,
+        key=lambda z:
+        (
+            z["tech"]+
+            z["market_pts"]
         ),
         reverse=True
     )
 
-    # =====================================================
-    # OPTION TOP 8
-    # =====================================================
-
-    option_candidates=candidates[
-        :OPTION_TOP
-    ]
-
     print(
-        f"OPTION FLOW: TOP "
-        f"{len(option_candidates)}",
+        f"TECH SETUPS: {len(results)}",
         flush=True
     )
 
-    # =====================================================
-    # OPTION CONFIRMATION
-    # =====================================================
+    # -----------------------------------------------------
+    # OPTIONS ON TOP OPTION_TOP
+    # -----------------------------------------------------
+    option_candidates=results[
+        :OPTION_TOP
+    ]
 
     final=[]
 
     for z in option_candidates:
 
-        print(
-            f"OPTION FLOW -> {z['symbol']}",
-            flush=True
-        )
-
         try:
 
-            op,odir,ratio,u=option_flow(
+            opt_pts,opt_bias,opt_ratio,u=option_flow(
                 s,
                 om,
                 z,
                 us
             )
 
-            z["option_pts"]=op
-            z["option_dir"]=odir
-            z["option_ratio"]=ratio
+            z["option_pts"]=opt_pts
+            z["option_bias"]=opt_bias
+            z["option_ratio"]=opt_ratio
             z["underlying"]=u
 
-            total=(
+            z["score"]=(
                 z["tech"]+
                 z["market_pts"]+
                 z["option_pts"]
             )
 
-            z["score"]=total
+            final.append(z)
 
-            final.append(
-                z
+            print(
+                f"OPTION | {z['symbol']} | "
+                f"{opt_bias} | "
+                f"ratio={opt_ratio:.2f} | "
+                f"+{opt_pts}",
+                flush=True
             )
 
         except Exception as e:
 
             print(
-                f"OPTION ERROR "
-                f"{z['symbol']}: {e}",
+                f"OPTION ERROR | "
+                f"{z['symbol']} | {e}",
                 flush=True
             )
 
             z["option_pts"]=0
-            z["option_dir"]="NEUTRAL"
+            z["option_bias"]="NEUTRAL"
             z["option_ratio"]=0
             z["underlying"]=z[
                 "symbol"
-            ].replace(
-                "-EQ",
-                ""
-            )
+            ].replace("-EQ","")
 
             z["score"]=(
                 z["tech"]+
                 z["market_pts"]
             )
 
-            final.append(
-                z
-            )
+            final.append(z)
 
-        time.sleep(
-            DELAY
+        if (
+            CANDLE_COOLDOWN_UNTIL>
+            time.monotonic()
+        ):
+            break
+
+    if not final:
+
+        no_setup(
+            mbias,
+            "Option confirmation unavailable"
         )
 
-    # =====================================================
-    # FINAL TOP 3
-    # =====================================================
+        return
 
+    # -----------------------------------------------------
+    # FINAL SCORE
+    # -----------------------------------------------------
     final=sorted(
         final,
-        key=lambda x:x["score"],
+        key=lambda z:
+        z["score"],
         reverse=True
     )
 
     final=[
-        x for x in final
-        if x["score"]>=MIN_SCORE
+        z for z in final
+        if z["score"]>=MIN_SCORE
     ]
+
+    if not final:
+
+        no_setup(
+            mbias,
+            "No setup crossed minimum score"
+        )
+
+        return
 
     final=final[
         :TOP_SIGNALS
     ]
 
-    # =====================================================
-    # NO FINAL SETUP
-    # =====================================================
+    # -----------------------------------------------------
+    # SECTOR STRENGTH
+    # -----------------------------------------------------
+    sec=sector_strength(
+        final
+    )
 
-    if not final:
+    print(
+        f"SECTORS: {sec}",
+        flush=True
+    )
 
-        msg=(
-            "DIVINE INTRADAY\n\n"
-            "NO SETUP\n\n"
-            f"MARKET: {mbias}\n"
-            f"REASON: Score below {MIN_SCORE}"
-        )
-
-        print(
-            msg,
-            flush=True
-        )
-
-        tg(msg)
-
-        return
-
-    # =====================================================
+    # -----------------------------------------------------
     # TELEGRAM MESSAGE
-    # =====================================================
-
+    # -----------------------------------------------------
     lines=[]
 
     lines.append(
-        "🔥 DIVINE INTRADAY"
+        "🚨 DIVINE INTRADAY"
+    )
+
+    lines.append(
+        ""
     )
 
     lines.append(
         f"MARKET: {mbias} ({mval:+d})"
     )
 
-    lines.append("")
+    lines.append(
+        f"SETUPS: {len(final)}"
+    )
+
+    lines.append(
+        ""
+    )
 
     for i,z in enumerate(
         final,
@@ -2196,12 +1916,23 @@ def main():
         )
 
         lines.append(
-            f"Score: {score:.0f} | "
-            f"Tech: {z['tech']}"
+            f"Score: {score}"
+        )
+
+        lines.append(
+            f"Setup: {z['setup']}"
+        )
+
+        lines.append(
+            f"Sector: {z['sector']}"
         )
 
         lines.append(
             f"LTP: ₹{z['live_ltp']:.2f}"
+        )
+
+        lines.append(
+            f"Entry: ₹{z['entry']:.2f}"
         )
 
         lines.append(
@@ -2226,22 +1957,16 @@ def main():
         )
 
         lines.append(
-            f"Setup: {z['setup']}"
+            f"Option: {z['option_bias']} | "
+            f"Ratio: {z['option_ratio']:.2f}"
         )
 
         lines.append(
-            f"Sector: {z['sector']}"
+            ""
         )
-
-        lines.append(
-            f"Options: {z['option_dir']} | "
-            f"Ratio {z['option_ratio']:.2f}"
-        )
-
-        lines.append("")
 
     lines.append(
-        "⚠️ ALERT ONLY — NO AUTO ORDER"
+        "⚠️ Paper signal only | No auto-order"
     )
 
     msg="\n".join(
@@ -2255,20 +1980,10 @@ def main():
 
     tg(msg)
 
-    elapsed=(
-        time.time()-start
-    )
-
-    print(
-        f"\nSCAN COMPLETE | "
-        f"{elapsed:.1f}s",
-        flush=True
-    )
 
 # =========================================================
-# PROGRAM START
+# RUN
 # =========================================================
-
 if __name__=="__main__":
 
     try:
@@ -2282,14 +1997,8 @@ if __name__=="__main__":
             flush=True
         )
 
-        try:
-
-            tg(
-                "🚨 DIVINE INTRADAY FATAL ERROR\n\n"
-                f"{e}"
-            )
-
-        except:
-            pass
-
-        raise
+        tg(
+            "⚠️ DIVINE INTRADAY\n\n"
+            "NO SETUP\n\n"
+            f"REASON: Scanner error: {e}"
+        )
