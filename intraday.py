@@ -204,7 +204,7 @@ def sector_name(sym):
         if b in v: return k
     return "OTHER"
 
-def analyze(sym,tok,s,mbias,debug=True):
+def analyze(sym,tok,s,mbias,debug=false):
     clean=sym.replace("-EQ","").upper()
     if clean in IPO_BLOCK:
         if debug: print(f" ❌ {sym} REJECT: IPO_BLOCK",flush=True)
