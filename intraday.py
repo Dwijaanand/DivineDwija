@@ -15,7 +15,7 @@ MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPI
 MIN_PRICE=100
 MIN_VOL=100000
 SCAN_POOL=2500
-INTRADAY_UNIVERSE=15
+INTRADAY_UNIVERSE=50
 TOP_SIGNALS=3
 MIN_SCORE=70
 MIN_VOLX=1.2
@@ -29,7 +29,7 @@ OPTION_DELAY=.6
 CANDLE_RETRIES=3
 AB1021_BACKOFF=[8,18,35]
 
-ONE_DAY_DAYS=400
+ONE_DAY_DAYS=150
 FIVE_MIN_DAYS=5
 FIFTEEN_MIN_DAYS=7
 
@@ -335,7 +335,7 @@ def stars(s):
     return "★★★★★" if s>=90 else "★★★★☆" if s>=80 else "★★★☆☆" if s>=70 else "★★☆☆☆"
 
 def main():
-    print(f"=== DIVINE V8.7 5M + 15M + DAILY FULL MARKET 2500 TOP 50 | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
+    print(f"=== DIVINE INTRADAY 5M + 15M + DAILY FULL MARKET 2500 TOP 50 | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
 
     s=login()
     m=master()
@@ -366,7 +366,7 @@ def main():
     print(f"Total Quotes received: {len(qdf)}",flush=True)
 
     if qdf.empty:
-        tg("⚠️ DIVINE V8.7\n\nNO SETUP\nREASON: Quotes empty / Market closed")
+        tg("⚠️ DIVINE INTRADAY\n\nNO SETUP\nREASON: Quotes empty / Market closed")
         return
 
     token_map={}; sym_map={}
@@ -412,7 +412,7 @@ def main():
         time.sleep(.2)
 
     if not results:
-        msg=f"DIVINE V8.7 {datetime.now(IST):%d %b %H:%M} | No setup in Top 50 Vol | Market {mbias}"
+        msg=f"DIVINE INTRADAY {datetime.now(IST):%d %b %H:%M} | No setup in Top 50 Vol | Market {mbias}"
         print(msg,flush=True); tg(msg); return
 
     results=sorted(results,key=lambda x:x["tech"],reverse=True)[:TOP_SIGNALS]
