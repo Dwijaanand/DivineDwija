@@ -29,7 +29,8 @@ OPTION_DELAY=.6
 CANDLE_RETRIES=3
 AB1021_BACKOFF=[8,18,35]
 
-ONE_DAY_DAYS=150
+# FIX: 220 calendar days gives enough trading sessions for 120 daily candles
+ONE_DAY_DAYS=220
 FIVE_MIN_DAYS=5
 FIFTEEN_MIN_DAYS=7
 
@@ -210,8 +211,11 @@ def analyze(sym,tok,s,mbias,debug=True):
         return None
 
     d_daily=candles(s,tok,ONE_DAY_DAYS,"ONE_DAY","NSE")
-    if d_daily is None or len(d_daily)<120:
-        if debug: print(f" ❌ {sym} REJECT: DAILY data empty / <120 candles",flush=True)
+    if d_daily is None:
+        if debug: print(f" ❌ {sym} REJECT: DAILY API returned empty/failed",flush=True)
+        return None
+    if len(d_daily)<120:
+        if debug: print(f" ❌ {sym} REJECT: DAILY candles={len(d_daily)} <120",flush=True)
         return None
 
     d5=candles(s,tok,FIVE_MIN_DAYS,"FIVE_MINUTE","NSE")
@@ -278,52 +282,25 @@ def analyze(sym,tok,s,mbias,debug=True):
 
     if tech<60:
         if debug:
-            print(
-                f" ❌ {sym} REJECT: tech={tech} <60 dir={direction} "
-                f"buy={buy} sell={sell} 15M bull={bull15} bear={bear15} "
-                f"5M bull={bull5} bear={bear5} RSI={a.rsi:.1f} volx={vol:.2f}",
-                flush=True
-            )
+            print(f" ❌ {sym} REJECT: tech={tech} <60 dir={direction} buy={buy} sell={sell} 15M bull={bull15} bear={bear15} 5M bull={bull5} bear={bear5} RSI={a.rsi:.1f} volx={vol:.2f}",flush=True)
         return None
 
     if vol<MIN_VOLX:
-        if debug:
-            print(
-                f" ❌ {sym} REJECT: volx={vol:.2f} <{MIN_VOLX} "
-                f"dir={direction} tech={tech}",
-                flush=True
-            )
+        if debug: print(f" ❌ {sym} REJECT: volx={vol:.2f} <{MIN_VOLX} dir={direction} tech={tech}",flush=True)
         return None
 
     if sector_name(sym)=="OTHER" and tech<85:
-        if debug:
-            print(
-                f" ❌ {sym} REJECT: OTHER sector tech={tech} <85",
-                flush=True
-            )
+        if debug: print(f" ❌ {sym} REJECT: OTHER sector tech={tech} <85",flush=True)
         return None
 
     if direction=="BUY" and not daily_bull:
-        if debug:
-            print(
-                f" ❌ {sym} REJECT: BUY but DAILY not BULL "
-                f"daily={daily.close:.1f} ema20={daily.ema20:.1f} "
-                f"ema50={daily.ema50:.1f} slope={daily.ema20slope:.2f}",
-                flush=True
-            )
+        if debug: print(f" ❌ {sym} REJECT: BUY but DAILY not BULL daily={daily.close:.1f} ema20={daily.ema20:.1f} ema50={daily.ema50:.1f} slope={daily.ema20slope:.2f}",flush=True)
         return None
 
     if direction=="SELL" and not daily_bear:
-        if debug:
-            print(
-                f" ❌ {sym} REJECT: SELL but DAILY not BEAR "
-                f"daily={daily.close:.1f} ema20={daily.ema20:.1f} "
-                f"ema50={daily.ema50:.1f} slope={daily.ema20slope:.2f}",
-                flush=True
-            )
+        if debug: print(f" ❌ {sym} REJECT: SELL but DAILY not BEAR daily={daily.close:.1f} ema20={daily.ema20:.1f} ema50={daily.ema50:.1f} slope={daily.ema20slope:.2f}",flush=True)
         return None
 
-    # SL check
     if direction=="BUY":
         sw=float(d5.low.iloc[-8:-2].min())
         sl=min(entry-atr,sw-0.15*atr)
@@ -336,64 +313,33 @@ def analyze(sym,tok,s,mbias,debug=True):
     risk=abs(entry-sl)
 
     if risk/entry<MIN_SL_PCT:
-        if debug:
-            print(
-                f" ❌ {sym} REJECT: risk {risk/entry*100:.3f}% "
-                f"< {MIN_SL_PCT*100}%",
-                flush=True
-            )
+        if debug: print(f" ❌ {sym} REJECT: risk {risk/entry*100:.3f}% < {MIN_SL_PCT*100}%",flush=True)
         return None
 
-    if debug:
-        print(
-            f" ✅ {sym} PASS: {direction} tech={tech} "
-            f"volx={vol:.2f} "
-            f"daily={'BULL' if daily_bull else 'BEAR'}",
-            flush=True
-        )
+    if debug: print(f" ✅ {sym} PASS: {direction} tech={tech} volx={vol:.2f} daily={'BULL' if daily_bull else 'BEAR'}",flush=True)
 
     t1=entry+(1.5*risk if direction=="BUY" else -1.5*risk)
     t2=entry+(2*risk if direction=="BUY" else -2*risk)
     t3=entry+(3*risk if direction=="BUY" else -3*risk)
 
-    setup=(
-        "BREAKOUT"
-        if (breakout_buy if direction=="BUY" else breakout_sell)
-        else "PULLBACK/VWAP"
-        if (above_vwap if direction=="BUY" else below_vwap)
-        else "TREND"
-    )
+    setup="BREAKOUT" if (breakout_buy if direction=="BUY" else breakout_sell) else "PULLBACK/VWAP" if (above_vwap if direction=="BUY" else below_vwap) else "TREND"
 
-    market_pts=(
-        -8
-        if ((mbias=="BULLISH" and direction=="SELL") or
-            (mbias=="BEARISH" and direction=="BUY"))
-        else (0 if mbias=="NEUTRAL" else 8)
-    )
+    market_pts=(-8 if ((mbias=="BULLISH" and direction=="SELL") or (mbias=="BEARISH" and direction=="BUY")) else (0 if mbias=="NEUTRAL" else 8))
 
     return {
-        "symbol":sym,
-        "direction":direction,
-        "tech":tech,
-        "market_pts":market_pts,
-        "entry":entry,
-        "sl":sl,
-        "t1":t1,
-        "t2":t2,
-        "t3":t3,
-        "setup":setup,
-        "sector":sector_name(sym),
-        "rsi":float(a.rsi),
-        "volx":vol,
+        "symbol":sym,"direction":direction,"tech":tech,"market_pts":market_pts,
+        "entry":entry,"sl":sl,"t1":t1,"t2":t2,"t3":t3,"setup":setup,
+        "sector":sector_name(sym),"rsi":float(a.rsi),"volx":vol,
         "tf5":"BULLISH" if bull5 else "BEARISH" if bear5 else "NEUTRAL",
         "tf15":"BULLISH" if bull15 else "BEARISH" if bear15 else "NEUTRAL",
         "daily":"BULLISH" if daily_bull else "BEARISH" if daily_bear else "NEUTRAL"
     }
 
-
 def option_flow(s,om,z,us):
-    if AB1021_COUNT>=2: return 0,"NEUTRAL",0,z["symbol"]
-    sym=z["symbol"].replace("-EQ","").upper(); spot=z["live_ltp"]; u=best_underlying(sym,us)
+    if AB1021_COUNT>=2: return 0,"NEUTRAL",0,z["entry"]
+    sym=z["symbol"].replace("-EQ","").upper()
+    spot=z["entry"]
+    u=best_underlying(sym,us)
     x=om[om.symbol.str.upper().str.startswith(u,na=False)].copy()
     if x.empty: return 0,"NEUTRAL",0,u
 
@@ -528,14 +474,12 @@ def main():
         if total<MIN_SCORE: continue
 
         star=stars(total)
-        msg=(
-            f"{star} {z['symbol']} {z['direction']} @ {z['entry']:.2f}\n"
-            f"Tech:{z['tech']} Mkt:{z['market_pts']} Opt:{opt_pts}({opt_bias} R:{ratio:.2f}) Total:{total}\n"
-            f"Setup:{z['setup']} Sec:{z['sector']} RSI:{z['rsi']:.1f} Volx:{z['volx']:.2f}x\n"
-            f"TF: D:{z['daily']} 15M:{z['tf15']} 5M:{z['tf5']}\n"
-            f"SL:{z['sl']:.2f} T1:{z['t1']:.2f} T2:{z['t2']:.2f} T3:{z['t3']:.2f}\n"
-            f"Market:{mbias} | 5M+15M+DAILY | Full Market Top50"
-        )
+        msg=(f"{star} {z['symbol']} {z['direction']} @ {z['entry']:.2f}\n"
+             f"Tech:{z['tech']} Mkt:{z['market_pts']} Opt:{opt_pts}({opt_bias} R:{ratio:.2f}) Total:{total}\n"
+             f"Setup:{z['setup']} Sec:{z['sector']} RSI:{z['rsi']:.1f} Volx:{z['volx']:.2f}x\n"
+             f"TF: D:{z['daily']} 15M:{z['tf15']} 5M:{z['tf5']}\n"
+             f"SL:{z['sl']:.2f} T1:{z['t1']:.2f} T2:{z['t2']:.2f} T3:{z['t3']:.2f}\n"
+             f"Market:{mbias} | 5M+15M+DAILY | Full Market Top50")
         final_msgs.append(msg)
 
     if final_msgs:
