@@ -16,13 +16,12 @@ TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
 # =========================================================
-# CORE SETTINGS
+# CORE SETTINGS - STRATEGY UNCHANGED
 # =========================================================
 
 MIN_PRICE=100
 MIN_VOL=200000
 
-# Live quote universe
 TOP_UNIVERSE=40
 INTRADAY_UNIVERSE=20
 
@@ -34,7 +33,7 @@ MIN_VOLX=1.2
 CANDLE_DELAY=1.15
 CANDLE_RETRIES=3
 
-# Retry backoff
+# Retry / AB1021
 AB1021_BACKOFF=[8,18,35]
 
 # Historical API emergency cooldown
@@ -43,7 +42,6 @@ HIST_COOLDOWN=120
 # Normal processing delay
 DELAY=.25
 
-# Minimum SL distance
 MIN_SL_PCT=.004
 
 # Options
@@ -53,7 +51,7 @@ OPTION_STRIKES=2
 OPTION_DELAY=.25
 OPTION_TOP=8
 
-# Live quote API
+# Live quote
 QUOTE_BATCH=50
 QUOTE_DELAY=1.2
 
@@ -86,7 +84,7 @@ UNDERLYING_FIX={
 }
 
 # =========================================================
-# IPO / NEW LISTING BLOCK
+# IPO BLOCK
 # =========================================================
 
 IPO_BLOCK={
@@ -109,7 +107,10 @@ IPO_BLOCK={
 def tg(x):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM SECRETS MISSING",flush=True)
+        print(
+            "TELEGRAM SECRETS MISSING",
+            flush=True
+        )
         return
 
     try:
@@ -142,6 +143,7 @@ def login():
         PASSWORD,
         TOTP_SECRET
     ]):
+
         raise RuntimeError(
             "Missing Angel One GitHub Secrets"
         )
@@ -213,12 +215,10 @@ def master():
 
 def equity_master(m):
 
-    x=m[
+    return m[
         (m["exch_seg"]=="NSE") &
         m["symbol"].str.endswith("-EQ")
     ].copy()
-
-    return x
 
 
 def option_master(m):
@@ -238,7 +238,7 @@ def option_master(m):
         errors="coerce"
     )
 
-    x=x[
+    return x[
         x["symbol"]
         .str.upper()
         .str.contains(
@@ -247,8 +247,6 @@ def option_master(m):
             na=False
         )
     ].copy()
-
-    return x
 
 # =========================================================
 # OPTION UNDERLYINGS
@@ -368,7 +366,6 @@ def quotes(s,tokens):
                 flush=True
             )
 
-        # Conservative spacing
         time.sleep(
             QUOTE_DELAY
         )
@@ -383,7 +380,7 @@ def quotes(s,tokens):
     return q
 
 # =========================================================
-# GLOBAL HISTORICAL THROTTLE
+# GLOBAL CANDLE RATE LIMITER
 # =========================================================
 
 def candle_wait():
@@ -424,15 +421,15 @@ def candles(
         int(days)
     )
 
-    # Cache
+    # Cache successful calls
     if cache_key in CANDLE_CACHE:
 
         return CANDLE_CACHE[
             cache_key
         ].copy()
 
-    # Emergency block
-    if time.monotonic() < _HIST_BLOCK_UNTIL:
+    # Emergency cooldown
+    if time.monotonic()< _HIST_BLOCK_UNTIL:
 
         return None
 
@@ -467,9 +464,7 @@ def candles(
             )
 
             # -------------------------------------------------
-            # IMPORTANT:
-            # SmartAPI can return AB1021 as a normal dict
-            # instead of raising an exception.
+            # IMPORTANT AB1021 RESPONSE HANDLING
             # -------------------------------------------------
 
             if isinstance(r,dict):
@@ -511,7 +506,6 @@ def candles(
                         flush=True
                     )
 
-                    # Repeated rate-limit response
                     if _CONSECUTIVE_AB1021>=3:
 
                         _HIST_BLOCK_UNTIL=(
@@ -538,6 +532,11 @@ def candles(
                             )
                         ]
 
+                        print(
+                            f"RATE BACKOFF: {wait}s",
+                            flush=True
+                        )
+
                         time.sleep(
                             wait
                         )
@@ -560,10 +559,6 @@ def candles(
             else:
 
                 data=None
-
-            # -------------------------------------------------
-            # VALID DATA
-            # -------------------------------------------------
 
             if data is None:
                 continue
@@ -620,7 +615,7 @@ def candles(
                 )
             )
 
-            # Successful request resets consecutive AB1021
+            # Successful request
             _CONSECUTIVE_AB1021=0
 
             CANDLE_CACHE[
@@ -867,16 +862,8 @@ def market_bias(s):
     vals=[]
 
     for name,tok,ex in [
-        (
-            "NIFTY",
-            "99926000",
-            "NSE"
-        ),
-        (
-            "SENSEX",
-            "99919000",
-            "BSE"
-        )
+        ("NIFTY","99926000","NSE"),
+        ("SENSEX","99919000","BSE")
     ]:
 
         d=candles(
@@ -1005,7 +992,7 @@ def analyze(
         return None
 
     # -----------------------------------------------------
-    # DAILY
+    # DAILY HISTORY
     # -----------------------------------------------------
 
     d_daily=candles(
@@ -1092,7 +1079,6 @@ def analyze(
         else a.close
     )
 
-    # Use candle ATR
     atr=max(
         float(a.atr),
         entry*.003
@@ -1149,7 +1135,7 @@ def analyze(
     )
 
     # -----------------------------------------------------
-    # BUY
+    # BUY SCORE
     # -----------------------------------------------------
 
     buy=sum([
@@ -1162,7 +1148,7 @@ def analyze(
     ])
 
     # -----------------------------------------------------
-    # SELL
+    # SELL SCORE
     # -----------------------------------------------------
 
     sell=sum([
@@ -1201,6 +1187,7 @@ def analyze(
         sym
     )
 
+    # Avoid weak random OTHER stocks
     if (
         sec=="OTHER" and
         tech<85
@@ -1250,6 +1237,7 @@ def analyze(
         )
 
         if sl>=entry:
+
             sl=entry-atr
 
     else:
@@ -1264,6 +1252,7 @@ def analyze(
         )
 
         if sl<=entry:
+
             sl=entry+atr
 
     risk=abs(
@@ -1282,17 +1271,23 @@ def analyze(
     # TARGETS
     # -----------------------------------------------------
 
-    if direction=="BUY":
+    t1=entry+(
+        1.5*risk
+        if direction=="BUY"
+        else -1.5*risk
+    )
 
-        t1=entry+1.5*risk
-        t2=entry+2*risk
-        t3=entry+3*risk
+    t2=entry+(
+        2*risk
+        if direction=="BUY"
+        else -2*risk
+    )
 
-    else:
-
-        t1=entry-1.5*risk
-        t2=entry-2*risk
-        t3=entry-3*risk
+    t3=entry+(
+        3*risk
+        if direction=="BUY"
+        else -3*risk
+    )
 
     # -----------------------------------------------------
     # SETUP
@@ -1319,26 +1314,19 @@ def analyze(
         setup="TREND"
 
     return {
-
         "symbol":sym,
         "direction":direction,
-
         "tech":tech,
         "market_pts":market_pts,
-
         "entry":entry,
         "sl":sl,
-
         "t1":t1,
         "t2":t2,
         "t3":t3,
-
         "rsi":float(a.rsi),
         "volx":vol,
-
         "setup":setup,
         "sector":sec,
-
         "live_ltp":entry,
         "live_vol":live_vol
     }
@@ -1447,14 +1435,14 @@ def option_flow(
         abs(float(q)-spot)
     )
 
-    gaps=[
+    other_gaps=[
         abs(q-atm)
         for q in strikes
         if q!=atm
     ]
 
     gap=min(
-        gaps or [1]
+        other_gaps or [1]
     )
 
     allowed=[
@@ -1470,7 +1458,6 @@ def option_flow(
         )
     ].copy()
 
-    # Closest contracts first
     x["dist"]=(
         x.strike_num-atm
     ).abs()
@@ -1579,12 +1566,14 @@ def option_flow(
 
     ca=(
         float(np.mean(cm))
-        if cm else 0
+        if cm
+        else 0
     )
 
     pa=(
         float(np.mean(pm))
-        if pm else 0
+        if pm
+        else 0
     )
 
     if (
@@ -1644,10 +1633,21 @@ def main():
     start=time.time()
 
     print(
-        "\n"
-        "========================================\n"
-        "      DIVINE INTRADAY V8.2 SAFE\n"
-        f"      {datetime.now(IST):%d %b %Y %H:%M:%S IST}\n"
+        "\n========================================",
+        flush=True
+    )
+
+    print(
+        "      DIVINE INTRADAY V8.2 SAFE",
+        flush=True
+    )
+
+    print(
+        f"      {datetime.now(IST):%d %b %Y %H:%M:%S IST}",
+        flush=True
+    )
+
+    print(
         "========================================",
         flush=True
     )
@@ -1715,7 +1715,8 @@ def main():
 
         tg(
             "⚠️ DIVINE INTRADAY\n"
-            "MASTER FAILED"
+            "MASTER FAILED\n"
+            f"{e}"
         )
 
         return
@@ -1767,32 +1768,40 @@ def main():
 
         return
 
-    # Normalize token
+    # =====================================================
+    # NORMALIZE TOKEN
+    # =====================================================
+
     if "symbolToken" in q.columns:
 
-        q["symbolToken"]=
-            q["symbolToken"].astype(str)
+        q["symbolToken"]=q[
+            "symbolToken"
+        ].astype(str)
 
     elif "symboltoken" in q.columns:
 
-        q["symbolToken"]=
-            q["symboltoken"].astype(str)
+        q["symbolToken"]=q[
+            "symboltoken"
+        ].astype(str)
+
+    elif "token" in q.columns:
+
+        q["symbolToken"]=q[
+            "token"
+        ].astype(str)
 
     else:
 
-        q["symbolToken"]=
-            q.get(
-                "token",
-                ""
-            ).astype(str)
+        q["symbolToken"]=""
 
-    # Normalize LTP
+    # =====================================================
+    # NORMALIZE LTP / VOLUME
+    # =====================================================
+
     if "ltp" not in q.columns:
-
         q["ltp"]=0
 
     if "tradeVolume" not in q.columns:
-
         q["tradeVolume"]=0
 
     q["ltp"]=pd.to_numeric(
@@ -1805,9 +1814,9 @@ def main():
         errors="coerce"
     ).fillna(0)
 
-    # -----------------------------------------------------
-    # Join symbol master
-    # -----------------------------------------------------
+    # =====================================================
+    # JOIN MASTER
+    # =====================================================
 
     em2=em[
         [
@@ -1816,8 +1825,9 @@ def main():
         ]
     ].copy()
 
-    em2["token"]=
-        em2["token"].astype(str)
+    em2["token"]=em2[
+        "token"
+    ].astype(str)
 
     q=q.merge(
         em2,
@@ -1826,18 +1836,21 @@ def main():
         how="inner"
     )
 
-    # -----------------------------------------------------
-    # Price / volume filter
-    # -----------------------------------------------------
+    # =====================================================
+    # PRICE / VOLUME FILTER
+    # =====================================================
 
     q=q[
-        (q.ltp>=MIN_PRICE) &
-        (q.tradeVolume>=MIN_VOL)
+        (q["ltp"]>=MIN_PRICE) &
+        (q["tradeVolume"]>=MIN_VOL)
     ].copy()
 
-    # IPO block
+    # =====================================================
+    # IPO BLOCK
+    # =====================================================
+
     q["clean"]=(
-        q.symbol
+        q["symbol"]
         .str.replace(
             "-EQ",
             "",
@@ -1847,12 +1860,15 @@ def main():
     )
 
     q=q[
-        ~q.clean.isin(
+        ~q["clean"].isin(
             IPO_BLOCK
         )
     ].copy()
 
-    # Highest live volume first
+    # =====================================================
+    # HIGHEST VOLUME FIRST
+    # =====================================================
+
     q=q.sort_values(
         "tradeVolume",
         ascending=False
@@ -1869,26 +1885,35 @@ def main():
 
     if q.empty:
 
-        tg(
-            "DIVINE INTRADAY\n"
-            f"MARKET: {mbias}\n\n"
-            "NO LIQUID STOCK FOUND"
+        msg=(
+            "DIVINE INTRADAY\n\n"
+            "NO SETUP\n\n"
+            f"MARKET: {mbias}\n"
+            "REASON: No liquid stock passed filter"
         )
+
+        print(
+            msg,
+            flush=True
+        )
+
+        tg(msg)
 
         return
 
     # =====================================================
-    # DAILY + INTRADAY ANALYSIS
+    # STOCK ANALYSIS
     # =====================================================
 
     candidates=[]
 
     scan=q.head(
-        TOP_UNIVERSE
+        INTRADAY_UNIVERSE
     )
 
     print(
-        "STARTING STOCK ANALYSIS...",
+        f"STARTING INTRADAY ANALYSIS: "
+        f"{len(scan)} stocks",
         flush=True
     )
 
@@ -1898,19 +1923,19 @@ def main():
     ):
 
         sym=str(
-            row.symbol
+            row["symbol"]
         )
 
         tok=str(
-            row.token
+            row["token"]
         )
 
         ltp=float(
-            row.ltp
+            row["ltp"]
         )
 
-        tv=float(
-            row.tradeVolume
+        trade_vol=float(
+            row["tradeVolume"]
         )
 
         print(
@@ -1925,7 +1950,7 @@ def main():
                 sym,
                 tok,
                 ltp,
-                tv,
+                trade_vol,
                 s,
                 mbias
             )
@@ -1954,8 +1979,6 @@ def main():
             DELAY
         )
 
-        # If historical API gets blocked,
-        # don't keep hammering it.
         if time.monotonic() < _HIST_BLOCK_UNTIL:
 
             print(
@@ -1970,6 +1993,10 @@ def main():
         f"TECH CANDIDATES: {len(candidates)}",
         flush=True
     )
+
+    # =====================================================
+    # NO TECH CANDIDATE
+    # =====================================================
 
     if not candidates:
 
@@ -2002,7 +2029,7 @@ def main():
         return
 
     # =====================================================
-    # TOP 8 BEFORE OPTIONS
+    # SORT TECH CANDIDATES
     # =====================================================
 
     candidates=sorted(
@@ -2014,17 +2041,22 @@ def main():
         reverse=True
     )
 
+    # =====================================================
+    # OPTION TOP 8
+    # =====================================================
+
     option_candidates=candidates[
         :OPTION_TOP
     ]
 
     print(
-        f"OPTION FLOW: TOP {len(option_candidates)}",
+        f"OPTION FLOW: TOP "
+        f"{len(option_candidates)}",
         flush=True
     )
 
     # =====================================================
-    # OPTIONS CONFIRMATION
+    # OPTION CONFIRMATION
     # =====================================================
 
     final=[]
@@ -2050,30 +2082,10 @@ def main():
             z["option_ratio"]=ratio
             z["underlying"]=u
 
-            # Option conflict penalty
-            if (
-                odir=="BEARISH" and
-                z["direction"]=="BUY"
-            ):
-
-                z["option_conflict"]=-5
-
-            elif (
-                odir=="BULLISH" and
-                z["direction"]=="SELL"
-            ):
-
-                z["option_conflict"]=-5
-
-            else:
-
-                z["option_conflict"]=0
-
             total=(
                 z["tech"]+
                 z["market_pts"]+
-                z["option_pts"]+
-                z["option_conflict"]
+                z["option_pts"]
             )
 
             z["score"]=total
@@ -2085,14 +2097,20 @@ def main():
         except Exception as e:
 
             print(
-                f"OPTION ERROR {z['symbol']}: {e}",
+                f"OPTION ERROR "
+                f"{z['symbol']}: {e}",
                 flush=True
             )
 
             z["option_pts"]=0
             z["option_dir"]="NEUTRAL"
             z["option_ratio"]=0
-            z["option_conflict"]=0
+            z["underlying"]=z[
+                "symbol"
+            ].replace(
+                "-EQ",
+                ""
+            )
 
             z["score"]=(
                 z["tech"]+
@@ -2127,7 +2145,7 @@ def main():
     ]
 
     # =====================================================
-    # TELEGRAM
+    # NO FINAL SETUP
     # =====================================================
 
     if not final:
@@ -2147,6 +2165,10 @@ def main():
         tg(msg)
 
         return
+
+    # =====================================================
+    # TELEGRAM MESSAGE
+    # =====================================================
 
     lines=[]
 
@@ -2212,13 +2234,11 @@ def main():
         )
 
         lines.append(
-            f"Options: {z['option_dir']} "
-            f"| Ratio {z['option_ratio']:.2f}"
+            f"Options: {z['option_dir']} | "
+            f"Ratio {z['option_ratio']:.2f}"
         )
 
-        lines.append(
-            ""
-        )
+        lines.append("")
 
     lines.append(
         "⚠️ ALERT ONLY — NO AUTO ORDER"
@@ -2245,9 +2265,8 @@ def main():
         flush=True
     )
 
-
 # =========================================================
-# ACTUAL PROGRAM START
+# PROGRAM START
 # =========================================================
 
 if __name__=="__main__":
@@ -2263,9 +2282,14 @@ if __name__=="__main__":
             flush=True
         )
 
-        tg(
-            "🚨 DIVINE INTRADAY FATAL ERROR\n\n"
-            f"{e}"
-        )
+        try:
+
+            tg(
+                "🚨 DIVINE INTRADAY FATAL ERROR\n\n"
+                f"{e}"
+            )
+
+        except:
+            pass
 
         raise
