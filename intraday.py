@@ -71,10 +71,16 @@ def login():
 def master():
     r=requests.get(MASTER_URL,timeout=30); r.raise_for_status()
     x=pd.DataFrame(r.json()); x["token"]=x["token"].astype(str); x["symbol"]=x["symbol"].astype(str)
+    # PRICE FIX 1: Only real EQ, not SME/others
+    x=x[x["instrumenttype"]=="EQ"] if "instrumenttype" in x.columns else x
     return x
 
 def equity_master(m):
-    return m[(m["exch_seg"]=="NSE") & m["symbol"].str.endswith("-EQ")].copy()
+    df=m[(m["exch_seg"]=="NSE") & m["symbol"].str.endswith("-EQ")].copy()
+    # PRICE FIX 2: Remove duplicate symbols keep first, remove HEROMOTORS etc typo symbols
+    df=df.sort_values("symbol")
+    df=df.drop_duplicates(subset=["symbol"], keep="first")
+    return df
 
 def option_master(m):
     x=m[m["exch_seg"]=="NFO"].copy()
@@ -207,7 +213,7 @@ def sector_name(sym):
         if b in v: return k
     return "OTHER"
 
-def analyze(sym,tok,s,mbias,debug=True):
+def analyze(sym,tok,s,mbias,quoted_ltp=0,debug=True):
     clean=sym.replace("-EQ","").upper()
     if clean in IPO_BLOCK:
         if debug: print(f" ❌ {sym} REJECT: IPO_BLOCK",flush=True)
@@ -216,6 +222,18 @@ def analyze(sym,tok,s,mbias,debug=True):
     if d_daily is None or len(d_daily)<120:
         if debug: print(f" ❌ {sym} REJECT: DAILY <120",flush=True)
         return None
+
+    # PRICE FIX: Daily close is true price
+    true_price = float(d_daily.iloc[-1].close)
+    # If quoted LTP is way off ( >25% diff ), use true price and log
+    if quoted_ltp>0 and abs(true_price - quoted_ltp)/true_price > 0.25:
+        if debug: print(f" ⚠️ {sym} PRICE MISMATCH: Quote={quoted_ltp:.2f} vs DailyClose={true_price:.2f} -> Using DailyClose",flush=True)
+
+    # Use true price for filter, not quote
+    if true_price < MIN_PRICE:
+        if debug: print(f" ❌ {sym} REJECT: TruePrice {true_price:.2f} < {MIN_PRICE}",flush=True)
+        return None
+
     d5=candles(s,tok,FIVE_MIN_DAYS,"FIVE_MINUTE","NSE")
     if d5 is None:
         if debug: print(f" ❌ {sym} REJECT: 5M empty",flush=True)
@@ -228,6 +246,11 @@ def analyze(sym,tok,s,mbias,debug=True):
     dd=feat(d_daily); d5f=feat(d5); d15f=feat(d15)
     daily=dd.iloc[-2]; a=d5f.iloc[-2]; b=d15f.iloc[-2]
     entry=float(a.close)
+    # Final price sanity: entry should be close to true_price (intraday vs daily)
+    if abs(entry - true_price)/true_price > 0.15:
+        if debug: print(f" ❌ {sym} REJECT: Intraday {entry:.2f} vs Daily {true_price:.2f} diff >15% (bad data)",flush=True)
+        return None
+
     atr=max(float(a.atr),entry*.003)
     daily_bull=(daily.close>daily.ema20 and daily.ema20>daily.ema50 and daily.ema20slope>0)
     daily_bear=(daily.close<daily.ema20 and daily.ema20<daily.ema50 and daily.ema20slope<0)
@@ -279,7 +302,7 @@ def analyze(sym,tok,s,mbias,debug=True):
     if risk/entry<MIN_SL_PCT:
         if debug: print(f" ❌ {sym} REJECT: risk {risk/entry*100:.3f}% < {MIN_SL_PCT*100}%",flush=True)
         return None
-    if debug: print(f" ✅ {sym} PASS: {direction} tech={tech} volx={vol:.2f} MACD={'BULL' if macd_buy else 'BEAR'} daily={'BULL' if daily_bull else 'BEAR'}",flush=True)
+    if debug: print(f" ✅ {sym} PASS: {direction} tech={tech} volx={vol:.2f} MACD={'BULL' if macd_buy else 'BEAR'} TruePrice={true_price:.2f}",flush=True)
     t1=entry+(1.5*risk if direction=="BUY" else -1.5*risk)
     t2=entry+(2*risk if direction=="BUY" else -2*risk)
     t3=entry+(3*risk if direction=="BUY" else -3*risk)
@@ -336,7 +359,7 @@ def stars(s):
     return "★★★★★" if s>=90 else "★★★★☆" if s>=80 else "★★★☆☆" if s>=70 else "★★☆☆☆"
 
 def main():
-    print(f"=== DIVINE INTRADAY 5M + 15M + DAILY + MACD FULL MARKET | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
+    print(f"=== DIVINE INTRADAY 5M + 15M + DAILY + MACD PRICE-FIXED | {datetime.now(IST):%d %b %H:%M:%S IST} ===",flush=True)
     s=login()
     m=master()
     em_full=equity_master(m)
@@ -375,15 +398,15 @@ def main():
     for tok,(ltp,vol) in token_map.items():
         sym=sym_map.get(tok,"")
         if not sym: continue
-        if ltp<MIN_PRICE: continue
         if vol<MIN_VOL: continue
+        # PRICE FIX: LTP filter ab daily candle se hoga, yahan sirf volume se filter
         all_with_vol.append((sym,tok,ltp,vol))
-    print(f"After Price>{MIN_PRICE} Vol>{MIN_VOL} filter: {len(all_with_vol)}",flush=True)
+    print(f"After Vol>{MIN_VOL} filter: {len(all_with_vol)} (Price filter will be done via Daily Close)",flush=True)
     all_with_vol=sorted(all_with_vol,key=lambda x:x[3],reverse=True)
     top50=all_with_vol[:50]
     print(f"\n=== TOP 50 HIGH VOLUME FROM {len(all_with_vol)} STOCKS ===",flush=True)
     for i,(sym,tok,ltp,vol) in enumerate(top50,1):
-        print(f"{i:2d}. {sym:<18s} {ltp:8.2f} Vol:{int(vol)}",flush=True)
+        print(f"{i:2d}. {sym:<18s} Quote:{ltp:8.2f} Vol:{int(vol)}",flush=True)
     if not top50:
         msg=f"No stock after pure filter | Market {mbias}"
         print(msg,flush=True); tg(msg); return
@@ -391,8 +414,8 @@ def main():
     print(f"\nAnalyzing top {len(to_analyze)} for 5M + 15M + DAILY + MACD setup...",flush=True)
     results=[]
     for sym,tok,ltp,vol in to_analyze:
-        print(f"Analyzing {sym} LTP {ltp} Vol {vol}",flush=True)
-        res=analyze(sym,tok,s,mbias)
+        print(f"Analyzing {sym} Quote LTP {ltp} Vol {vol}",flush=True)
+        res=analyze(sym,tok,s,mbias,quoted_ltp=ltp)
         if res: results.append(res)
         time.sleep(.2)
     if not results:
@@ -410,7 +433,7 @@ def main():
              f"Setup:{z['setup']} Sec:{z['sector']} RSI:{z['rsi']:.1f} Volx:{z['volx']:.2f}x MACD:{z['macd_bias']}({z['macd']:.3f}/{z['macd_sig']:.3f})\n"
              f"TF: D:{z['daily']} 15M:{z['tf15']} 5M:{z['tf5']}\n"
              f"SL:{z['sl']:.2f} T1:{z['t1']:.2f} T2:{z['t2']:.2f} T3:{z['t3']:.2f}\n"
-             f"Market:{mbias} | 5M+15M+DAILY+MACD | Full Market Top50")
+             f"Market:{mbias} | 5M+15M+DAILY+MACD PRICE-FIXED")
         final_msgs.append(msg)
     if final_msgs:
         text="\n\n".join(final_msgs)
