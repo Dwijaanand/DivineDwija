@@ -1,9 +1,9 @@
-name: DIVINE INTRADAY OPTION
+name: DIVINE INTRADAY 
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "45 3 * * 1-5"   # 9:15 AM IST
+    - cron: "45 3 * * 1-5"   # 9:15 AM IST = 03:45 UTC
 
 jobs:
   scan:
@@ -21,13 +21,15 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - run: pip install -r requirements.txt
+      - name: Install deps
+        run: pip install -r requirements.txt
 
-      - name: Run DIVINE INTRADAY OPTION
+      - name: Run DIVINE INTRADAY OPTION MACD
         run: python intraday.py
         env:
-          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
-          DHAN_PASSWORD: ${{ secrets.DHAN_PASSWORD }}
-          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          API_KEY: ${{ secrets.API_KEY }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
