@@ -515,17 +515,21 @@ def signal_text(z):
 def main():
     print( f"\n=== DIVINE INTRADAY OPTION | F&O STOCKS ONLY | ATM +/-5 STRIKE CE/PE | 2-MONTH FLOW | " f"{datetime.now(IST):%d %b %Y %H:%M IST} ===" )
     if not DHAN_CLIENT_ID or not DHAN_PASSWORD or not DHAN_TOTP_SECRET or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        tg( "⚠️ DIVINE DHAN OPTION\n\n" "NO SETUP\n" "REASON: GitHub Secrets missing (DHAN_CLIENT_ID/DHAN_PASSWORD/DHAN_TOTP_SECRET/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)" )
+        tg( "⚠️ DIVINE INTRADAY OPTION\n\n" "NO SETUP\n" "REASON: GitHub Secrets missing (DHAN_CLIENT_ID/DHAN_PASSWORD/DHAN_TOTP_SECRET/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)" )
+        return
+    token=get_access_token()
+    if not token:
+        tg( "⚠️ DIVINE INTRADAY OPTION\n\nNO SETUP\nREASON: Dhan access token generation failed" )
         return
     inst=load_instruments()
     if inst.empty:
-        tg( "⚠️ DIVINE DHAN OPTION\n\n" "NO SETUP\n" "REASON: Dhan instrument master unavailable" )
+        tg( "⚠️ DIVINE INTRADAY OPTION\n\n" "NO SETUP\n" "REASON: Dhan instrument master unavailable" )
         return
     mbias,mp=market_bias()
     print("MARKET:",mbias)
     universe=build_stock_universe()
     if universe.empty:
-        tg( f"⚠️ DIVINE DHAN OPTION\n\n" f"NO SETUP\n" f"MARKET: {mbias}\n" f"REASON: Stock universe unavailable" )
+        tg( f"⚠️ DIVINE INTRADAY OPTION\n\n" f"NO SETUP\n" f"MARKET: {mbias}\n" f"REASON: Stock universe unavailable" )
         return
     stock_candidates=[]
     for i,(_,row) in enumerate(universe.iterrows(),1):
@@ -562,7 +566,7 @@ def main():
             stock_candidates.append(z)
         time.sleep(DELAY)
     if not stock_candidates:
-        tg( "⚠️ DIVINE DHAN OPTION\n\n" "NO SETUP\n\n" f"MARKET: {mbias}\n" f"STOCK UNIVERSE: {len(universe)}\n" f"MIN SCORE: {MIN_SCORE}\n" f"MACD: {MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}\nNEXT 2 EXPIRIES: CE + PE VOLUME/OI\n" "REASON: No stock + option confirmation passed" )
+        tg( "⚠️ DIVINE INTRADAY OPTION\n\n" "NO SETUP\n\n" f"MARKET: {mbias}\n" f"STOCK UNIVERSE: {len(universe)}\n" f"MIN SCORE: {MIN_SCORE}\n" f"MACD: {MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}\nNEXT 2 EXPIRIES: CE + PE VOLUME/OI\n" "REASON: No stock + option confirmation passed" )
         return
     stock_candidates=sorted( stock_candidates, key=lambda x:( x["final_score"], x["option_score"], x["stock_score"], x["stock_volx"] ), reverse=True )[:TOP_SIGNALS]
     tg( "🔥 DIVINE INTRADAY OPTION\n" f"MARKET: {mbias}\n" f"SIGNALS: {len(stock_candidates)}\n" f"MACD: {MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}\nNEXT 2 EXPIRIES: CE + PE VOLUME/OI\n" "F&O STOCK + DAILY/15M/5M + OPTION CONFIRMATION\n" "⚠️ NO AUTO ORDER" )
@@ -576,4 +580,4 @@ if __name__=="__main__":
         main()
     except Exception as e:
         print("FATAL:",e)
-        tg( "⚠️ DIVINE DHAN OPTION\n\n" "NO SETUP\n" f"REASON: Scanner error\n{str(e)[:300]}" )
+        tg( "⚠️ DIVINE INTRADAY OPTION\n\n" "NO SETUP\n" f"REASON: Scanner error\n{str(e)[:300]}" )
