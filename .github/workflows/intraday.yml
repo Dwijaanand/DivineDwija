@@ -1,29 +1,33 @@
-name: AI Intraday Scanner
+name: DIVINE INTRADAY OPTION
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "45 3 * * 1-5"   # 9:15 AM IST = 9:20 scan
+    - cron: "45 3 * * 1-5"   # 9:15 AM IST
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
-      group: intraday-scan
+      group: intraday-option-scan
       cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'
+          cache: "pip"
+
       - run: pip install -r requirements.txt
-      - run: python intraday.py
+
+      - name: Run DIVINE INTRADAY OPTION
+        run: python intraday.py
         env:
-          API_KEY: ${{ secrets.API_KEY }}
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_PASSWORD: ${{ secrets.DHAN_PASSWORD }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
