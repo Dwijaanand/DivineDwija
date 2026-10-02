@@ -3,7 +3,8 @@ name: DIVINE INTRADAY
 on:
   workflow_dispatch:
   schedule:
-    - cron: "45 3 * * 1-5"   # 9:15 AM IST = 03:45 UTC
+    - cron: "0 4 * * 1-5"   # 9:30 AM IST = 04:00 UTC
+    - cron: "0 5 * * 1-5"   # 10:30 AM IST = 05:00 UTC
 
 jobs:
   scan:
