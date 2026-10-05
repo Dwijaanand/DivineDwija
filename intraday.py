@@ -189,7 +189,7 @@ def narrow_range(x,n=NR_LOOKBACK):
     return "NONE"
 
 def market_bias(s):
-    d=candles(s,"99926000",10,"FIFTEEN_MINUTE","NSE")
+    d=candles(s,"26000",10,"FIFTEEN_MINUTE","NSE")
     if d is None or len(d)<30:return "NEUTRAL",0
     x=feat(d).iloc[-2]
     bull=x.close>x.ema20>x.ema50 and x.ema20slope>0 and x.rsi>=50 and x.macd>x.macd_sig
