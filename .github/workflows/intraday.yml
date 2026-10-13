@@ -3,8 +3,9 @@ name: DIVINE INTRADAY
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 4 * * 1-5"   # 9:30 AM IST = 04:00 UTC
-    - cron: "0 5 * * 1-5"   # 10:30 AM IST = 05:00 UTC
+    - cron: "25 3 * * 1-5"   # 08:55 AM IST - Warmup
+    - cron: "0 4 * * 1-5"    # 09:30 AM IST
+    - cron: "0 5 * * 1-5"    # 10:30 AM IST
 
 jobs:
   scan:
@@ -34,3 +35,6 @@ jobs:
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SHARK_API_KEY: ${{ secrets.SHARK_API_KEY }}
+          SHARK_API_SECRET: ${{ secrets.SHARK_API_SECRET }}
+          SHARK_CLIENT_ID: ${{ secrets.SHARK_CLIENT_ID }}
