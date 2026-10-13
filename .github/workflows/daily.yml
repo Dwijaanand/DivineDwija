@@ -2,7 +2,8 @@ name: Dwija Run
 
 on:
   schedule:
-    - cron: '0 6 * * 1-5'  # 11:30 AM IST (Mon-Fri)
+    - cron: '0 6 * * 1-5'  # 11:30 AM IST target
+    - cron: '15 6 * * 1-5' # backup 11:45 AM IST
   workflow_dispatch:
 
 jobs:
@@ -25,7 +26,7 @@ jobs:
           pip install -r requirements.txt
           pip install smartapi-python pyotp pandas numpy requests pytz websocket-client logzero yfinance
 
-      - name: Run python scanner
+      - name: Run python scanner with IST check
         env:
           API_KEY: ${{ secrets.API_KEY }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
@@ -34,4 +35,15 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          python -c "
+          from datetime import datetime
+          import pytz, sys
+          ist = pytz.timezone('Asia/Kolkata')
+          now = datetime.now(ist)
+          print(f'Current IST: {now}')
+          # Sirf 11 AM se 12:30 PM ke beech chalne do
+          if not (11 <= now.hour <= 12):
+              print('Market time nahi hai, exit kar raha hu')
+              sys.exit(0)
+          "
           python scanner.py
